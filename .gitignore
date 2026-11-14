@@ -1,0 +1,13 @@
+/target
+/.cargo/
+
+# captures and IQ recordings
+*.pcap
+*.pcapng
+*.ci8
+*.cs8
+*.cu8
+*.ci16
+*.cs16
+*.cf32
+*.cfile
