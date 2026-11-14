@@ -141,6 +141,9 @@ struct CaptureArgs {
     /// Keep LE packets with a bad CRC
     #[arg(long)]
     keep_bad_crc: bool,
+    /// Hard decisions only: no LE CRC repair, no soft BR FEC decoding
+    #[arg(long)]
+    hard_decisions: bool,
     /// Bit errors tolerated in a BR sync word (0-2)
     #[arg(long, default_value_t = 2)]
     max_ac_errors: u32,
@@ -184,6 +187,10 @@ struct SynthArgs {
     /// Random seed
     #[arg(long, default_value_t = 1)]
     seed: u64,
+    /// Add realistic radio impairments (carrier offset and drift,
+    /// modulation index spread, phase noise)
+    #[arg(long)]
+    impaired: bool,
 }
 
 fn parse_hex_pair(s: &str, what: &str) -> anyhow::Result<(u32, u32)> {
@@ -255,12 +262,14 @@ fn capture(a: CaptureArgs) -> anyhow::Result<()> {
         keep_bad_crc: a.keep_bad_crc,
         max_aa_errors: a.max_aa_errors,
         rssi_offset: a.rssi_offset,
+        crc_repair: !a.hard_decisions,
         ..Default::default()
     });
     let bredr = (!a.no_bredr).then(|| BrConfig {
         max_ac_errors: a.max_ac_errors.min(2),
         rssi_offset: a.rssi_offset,
         known_uaps,
+        soft_decisions: !a.hard_decisions,
     });
     if ble.is_none() && bredr.is_none() {
         bail!("nothing to decode (--no-ble and --no-bredr)");
@@ -363,7 +372,18 @@ fn devices(lib: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 fn synth(a: SynthArgs) -> anyhow::Result<()> {
-    let (data, info) = btsdr::synth::demo_scenario(a.center, a.rate, a.duration, a.snr, a.seed);
+    let (data, info) = btsdr::synth::demo_scenario(
+        a.center,
+        a.rate,
+        a.duration,
+        a.snr,
+        a.seed,
+        if a.impaired {
+            btsdr::synth::Impairments::REALISTIC
+        } else {
+            btsdr::synth::Impairments::IDEAL
+        },
+    );
     std::fs::write(&a.output, &data).with_context(|| format!("writing {}", a.output.display()))?;
     eprintln!(
         "wrote {} ({:.2} s at {} Msps, centre {} MHz): {} LE advertising, {} + {} LE data, {} BR piconet packets (LAP {:06x}, UAP {:02x}), {} inquiry IDs, 1 FHS ({})",

@@ -36,6 +36,8 @@ HackRF One ──► channelizer (PFB) ──► burst detector ──► GFSK d
   promiscuously: the CRCInit is recovered by running the CRC backwards.
 - CRC-24 verification on every packet, plus central/peripheral direction
   inference from the 150 µs inter-frame spacing.
+- Soft-decision CRC repair: packets with up to two bit errors are fixed
+  using the least reliable bits.
 - Device names, company IDs and service UUIDs are extracted from
   advertising data.
 
@@ -46,6 +48,8 @@ HackRF One ──► channelizer (PFB) ──► burst detector ──► GFSK d
 - The UAP and master clock (CLK6-1) of each piconet are discovered
   automatically, so headers are de-whitened and their HEC verified.
 - Payload decoding with CRC check for FHS, DM1, DH1, DM3, DH3, DM5 and DH5.
+- Soft-decision FEC: soft majority voting for the header and Chase decoding
+  for the rate-2/3 payload code.
 - An FHS packet (inquiry or page response) reveals the full BD_ADDR, class of
   device and clock.
 
@@ -269,6 +273,7 @@ Capture and decode, live from a HackRF or from a file (`-i`).
 | `--max-ac-errors <n>` | 2 | Bit errors corrected in a BR sync word |
 | `--max-aa-errors <n>` | 2 | Bit errors tolerated in an LE access address |
 | `--keep-bad-crc` | | Also output LE packets with a bad CRC |
+| `--hard-decisions` | | Disable soft-decision decoding (LE CRC repair, BR soft FEC), for comparison |
 | `--rssi-offset <dB>` | 0 | Calibration offset added to signal/noise levels |
 | `-q, --quiet` | | Print only the summary |
 | `--status <s>` | 5 | Status line interval on stderr (0 = off) |
@@ -287,7 +292,8 @@ Writes a synthetic `ci8` recording containing:
 - inquiry ID packets and an FHS response.
 
 Options: `-o <file>`, `-f <MHz>`, `-s <Msps>`, `-t <seconds>`, `--snr <dB>`,
-`--seed <n>`.
+`--seed <n>`, and `--impaired` to add carrier offset and drift, modulation
+index spread and phase noise.
 
 ### `btsdr extcap`
 
@@ -342,6 +348,41 @@ Notes on the pseudo-headers:
 - **Repeatable experiments:** record the IQ once with `--record` and re-run
   the decoder offline with different settings.
 
+## Sensitivity
+
+`examples/benchmark.rs` measures the fraction of packets decoded versus SNR
+on synthetic captures. SNR is per 1 MHz channel, which equals Eb/N0 at
+1 Mbit/s. The channel is impaired within the specification limits: ±100 kHz
+carrier offset, up to 20 Hz/µs drift, ±10% modulation index spread and phase
+noise.
+
+```bash
+cargo run --release --example benchmark -- --impaired
+```
+
+SNR at which 50% of the packets are decoded (lower is better):
+
+| Packets | v0.1.0 (hard decisions) | current |
+|---------|------------------------:|--------:|
+| LE advertising | 11.4 dB | 8.9 dB |
+| LE data (empty PDUs and short payloads) | 9.6 dB | 8.3 dB |
+| BR header de-whitened (piconet locked) | 13.4 dB | 10.2 dB |
+| BR payload with valid CRC | 14.0 dB | 12.6 dB |
+| BR inquiry ID | 10.9 dB | 9.7 dB |
+
+The gains come from three changes:
+- **A narrower channel filter** (±0.6 MHz instead of ±0.8 MHz).
+- **Soft decisions.** CRC repair for LE; soft majority and Chase decoding of
+  the FEC for BR.
+- **A more robust piconet lock** for BR.
+
+On two indoor recordings, the same changes increased the number of
+CRC-valid LE advertising packets by 13%, and cut the remaining bad-CRC
+packets by 55–60%.
+
+At high SNR the curves saturate at 96–99%, because the synthetic scenario
+contains overlapping transmissions.
+
 ## Limitations
 
 - **LE:** only the LE 1M PHY. LE 2M and LE Coded are not demodulated.
@@ -389,6 +430,9 @@ The test suite includes:
 - **An end-to-end test** that synthesises LE and BR traffic and runs it
   through the whole pipeline.
 
+`cargo run --release --example benchmark` measures sensitivity; see
+[Sensitivity](#sensitivity).
+
 Source layout:
 
 ```
@@ -404,6 +448,7 @@ src/
   report.rs          console output and summary
   synth.rs           packet encoders, GFSK modulator, demo scenario
 tests/synthetic.rs   end-to-end test
+examples/benchmark.rs  packet success rate vs SNR
 ```
 
 ## Legal

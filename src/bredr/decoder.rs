@@ -40,6 +40,8 @@ pub struct BrConfig {
     pub rssi_offset: f32,
     /// LAPs whose UAP is known in advance.
     pub known_uaps: HashMap<u32, u8>,
+    /// Use soft decisions for the header (1/3) and payload (2/3) FEC.
+    pub soft_decisions: bool,
 }
 
 impl Default for BrConfig {
@@ -48,6 +50,7 @@ impl Default for BrConfig {
             max_ac_errors: 2,
             rssi_offset: 0.0,
             known_uaps: HashMap::new(),
+            soft_decisions: true,
         }
     }
 }
@@ -252,7 +255,14 @@ fn dewhitened(coded_info: &[u8], clk6: u8) -> Vec<u8> {
 
 /// Decode the payload of a basic-rate ACL packet (or FHS). Returns `None`
 /// if the type carries no verifiable payload or the bits do not decode.
-pub fn decode_payload(coded: &[u8], ptype: u8, uap: u8, clk6: u8) -> Option<Payload> {
+pub fn decode_payload(coded: &[u8], soft: &[f32], ptype: u8, uap: u8, clk6: u8) -> Option<Payload> {
+    let fec23 = |n: usize| {
+        if soft.len() >= n {
+            fec23_decode_soft(&coded[..n], &soft[..n])
+        } else {
+            fec23_decode(&coded[..n])
+        }
+    };
     let ti = type_info(ptype);
     if ptype <= 1 {
         return Some(Payload {
@@ -275,7 +285,7 @@ pub fn decode_payload(coded: &[u8], ptype: u8, uap: u8, clk6: u8) -> Option<Payl
                 if coded.len() < need {
                     return None;
                 }
-                fec23_decode(&coded[..need])?.0
+                fec23(need)?.0
             }
             _ => {
                 if coded.len() < hdr_bits {
@@ -301,7 +311,7 @@ pub fn decode_payload(coded: &[u8], ptype: u8, uap: u8, clk6: u8) -> Option<Payl
             if coded.len() < need {
                 return None;
             }
-            fec23_decode(&coded[..need])?
+            fec23(need)?
         }
         Fec::None => {
             if coded.len() < total_bits {
@@ -322,8 +332,14 @@ pub fn decode_payload(coded: &[u8], ptype: u8, uap: u8, clk6: u8) -> Option<Payl
     })
 }
 
-/// Can a packet of this TYPE plausibly last `air_bits` microseconds?
-fn type_plausible(ptype: u8, air_bits: usize) -> bool {
+/// Can a packet of this TYPE, sent in the slot whose master clock is
+/// `clk6`, plausibly last `air_bits` microseconds? Besides the length this
+/// uses one protocol rule: POLL is only sent by the master, and the master
+/// only transmits in slots with CLK1 = 0.
+fn type_plausible(ptype: u8, air_bits: usize, clk6: u8) -> bool {
+    if ptype == 1 && clk6 & 1 == 1 {
+        return false;
+    }
     let n = air_bits as i64;
     match ptype {
         0 | 1 => (n - 126).abs() <= 10,
@@ -350,6 +366,7 @@ struct RawPacket {
     header_w: u32,
     header_corrected: u8,
     payload_coded: Vec<u8>,
+    payload_soft: Vec<f32>,
     air_bits: usize,
     signal_dbm: i8,
     noise_dbm: i8,
@@ -360,6 +377,8 @@ pub struct Piconet {
     pub uap: Option<u8>,
     clk: Option<(f64, u8)>,
     votes: Vec<u16>,
+    /// Packets that cast at least one vote since the last reset.
+    voters: u16,
     t_first: f64,
     buffer: Vec<RawPacket>,
     pub first_seen: f64,
@@ -376,6 +395,7 @@ impl Piconet {
             uap: None,
             clk: None,
             votes: vec![0; 256 * 64],
+            voters: 0,
             t_first: t,
             buffer: Vec::new(),
             first_seen: t,
@@ -494,7 +514,11 @@ impl BrDecoder {
             return true;
         }
         self.stats.header_packets += 1;
-        let (hdr, corrected) = fec13_decode(&bits[hdr_start..hdr_start + 54]);
+        let (hdr, corrected) = if self.cfg.soft_decisions {
+            fec13_decode_soft(&d.soft[hdr_start..hdr_start + 54])
+        } else {
+            fec13_decode(&bits[hdr_start..hdr_start + 54])
+        };
         let end = (d.core_end_bit + 6).min(bits.len());
         let raw = RawPacket {
             time,
@@ -504,6 +528,11 @@ impl BrDecoder {
             header_w: bits::to_u32(&hdr),
             header_corrected: corrected as u8,
             payload_coded: bits[(hdr_start + 54).min(end)..end].to_vec(),
+            payload_soft: if self.cfg.soft_decisions {
+                d.soft[(hdr_start + 54).min(end)..end].to_vec()
+            } else {
+                Vec::new()
+            },
             air_bits,
             signal_dbm,
             noise_dbm,
@@ -578,10 +607,10 @@ impl BrDecoder {
                 continue;
             }
             let pt = ((h >> 3) & 0xF) as u8;
-            if !type_plausible(pt, raw.air_bits) {
+            if !type_plausible(pt, raw.air_bits, c) {
                 continue;
             }
-            if let Some(pl) = decode_payload(&raw.payload_coded, pt, uap, c) {
+            if let Some(pl) = decode_payload(&raw.payload_coded, &raw.payload_soft, pt, uap, c) {
                 if pl.crc_valid == Some(true) {
                     return self.finish_packet(raw, uap, c, Some(pl));
                 }
@@ -622,6 +651,7 @@ impl BrDecoder {
         if raw.time - pn.t_first > 8.0 {
             // slot grid drift makes old votes useless; start over
             pn.votes.iter_mut().for_each(|v| *v = 0);
+            pn.voters = 0;
             pn.t_first = raw.time;
         }
         let fixed_uap = pn.uap;
@@ -630,7 +660,7 @@ impl BrDecoder {
         for c in 0..64u8 {
             let h = raw.header_w ^ self.masks[c as usize];
             let pt = ((h >> 3) & 0xF) as u8;
-            if !type_plausible(pt, raw.air_bits) {
+            if !type_plausible(pt, raw.air_bits, c) {
                 continue;
             }
             let u = uap_from_header(h);
@@ -639,7 +669,7 @@ impl BrDecoder {
             }
             let mut w = 1u16;
             if type_info(pt).has_crc {
-                if let Some(pl) = decode_payload(&raw.payload_coded, pt, u, c) {
+                if let Some(pl) = decode_payload(&raw.payload_coded, &raw.payload_soft, pt, u, c) {
                     if pl.crc_valid == Some(true) {
                         w = 5;
                     }
@@ -649,6 +679,9 @@ impl BrDecoder {
             new_votes.push((u as usize * 64 + c0, w));
         }
         let pn = self.piconets.get_mut(&lap).unwrap();
+        if !new_votes.is_empty() {
+            pn.voters = pn.voters.saturating_add(1);
+        }
         for (idx, w) in new_votes {
             pn.votes[idx] = pn.votes[idx].saturating_add(w);
         }
@@ -663,7 +696,14 @@ impl BrDecoder {
                 second = v;
             }
         }
-        if best >= 6 && best >= 3 * second {
+        // The true (UAP, clock) pair collects a vote from nearly every packet.
+        // Because whitening is linear, a few other pairs collect votes from a
+        // fixed fraction of the packets (partial aliases, up to ~40 %), so a
+        // pair that clearly dominates the packet count is accepted as well.
+        let dominant = best >= 8
+            && best as u32 * 10 >= pn.voters as u32 * 6
+            && best as u32 * 2 >= second as u32 * 3;
+        if (best >= 6 && best >= 3 * second) || dominant {
             let uap = (best_i / 64) as u8;
             let c0 = (best_i % 64) as u8;
             pn.uap = Some(uap);
@@ -712,13 +752,13 @@ impl BrDecoder {
                 continue;
             }
             let pt = ((h >> 3) & 0xF) as u8;
-            let pl = decode_payload(&raw.payload_coded, pt, uap, c);
+            let pl = decode_payload(&raw.payload_coded, &raw.payload_soft, pt, uap, c);
             let crc_ok = pl.as_ref().is_some_and(|p| p.crc_valid == Some(true));
             if crc_ok {
                 best = Some((c, pl, true));
                 break;
             }
-            if best.is_none() && delta.abs() <= 1 && type_plausible(pt, raw.air_bits) {
+            if best.is_none() && delta.abs() <= 1 && type_plausible(pt, raw.air_bits, c) {
                 best = Some((c, pl, false));
             }
         }

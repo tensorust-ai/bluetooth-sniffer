@@ -142,6 +142,8 @@ pub struct BlePacket {
     pub noise_dbm: i8,
     pub direction: Direction,
     pub cfo_hz: f32,
+    /// Bits flipped by the soft-decision CRC repair (0 = received intact).
+    pub bits_corrected: u8,
 }
 
 impl BlePacket {

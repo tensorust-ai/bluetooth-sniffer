@@ -109,7 +109,11 @@ impl Reporter {
             p.access_address,
             dir,
             p.describe(),
-            if p.crc_valid { "" } else { " [BAD CRC]" }
+            match (p.crc_valid, p.bits_corrected) {
+                (false, _) => " [BAD CRC]".to_string(),
+                (true, 0) => String::new(),
+                (true, n) => format!(" [{n} bit(s) corrected]"),
+            }
         );
     }
 
@@ -155,9 +159,10 @@ impl Reporter {
         s += "\n=== Summary ===\n";
         if let Some(b) = ble {
             s += &format!(
-                "BLE: {} advertising + {} data packets (CRC ok), {} bad CRC, {} connections\n",
+                "BLE: {} advertising + {} data packets (CRC ok, {} after bit repair), {} bad CRC, {} connections\n",
                 b.stats.adv_packets,
                 b.stats.data_packets,
+                b.stats.crc_repaired,
                 b.stats.bad_crc,
                 b.stats.connections_seen
             );

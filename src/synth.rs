@@ -225,12 +225,46 @@ impl Gfsk {
     }
 }
 
+/// Radio impairments applied to every synthesised packet.
+#[derive(Clone, Copy, Debug)]
+pub struct Impairments {
+    /// Initial carrier offset, uniform in +-`cfo_hz`.
+    pub cfo_hz: f64,
+    /// Linear frequency drift during the packet, uniform in +- Hz/us.
+    pub drift_hz_per_us: f64,
+    /// Modulation index spread, uniform in +- this fraction of nominal.
+    pub h_spread: f64,
+    /// Random-walk phase noise, rad per sqrt(us).
+    pub phase_noise: f64,
+}
+
+impl Impairments {
+    /// Small carrier offset only.
+    pub const IDEAL: Self = Self {
+        cfo_hz: 30e3,
+        drift_hz_per_us: 0.0,
+        h_spread: 0.0,
+        phase_noise: 0.0,
+    };
+    /// Within the core specification limits: +-100 kHz offset, up to
+    /// 20 Hz/us drift (40 kHz over a 2 ms packet), +-10 % modulation index
+    /// (LE 0.45-0.55, BR 0.29-0.35) and mild phase noise.
+    pub const REALISTIC: Self = Self {
+        cfo_hz: 100e3,
+        drift_hz_per_us: 20.0,
+        h_spread: 0.1,
+        phase_noise: 0.05,
+    };
+}
+
 /// Wideband IQ buffer into which packets are mixed.
 pub struct Scene {
     pub fs: f64,
     pub center_mhz: u32,
     pub buf: Vec<Complex32>,
     gfsk: Gfsk,
+    imp: Impairments,
+    rng: XorShift,
 }
 
 /// Modulation index presets.
@@ -239,25 +273,46 @@ pub const BR_DEV: f64 = 160e3;
 
 impl Scene {
     pub fn new(fs: f64, center_mhz: u32, duration: f64) -> Self {
+        Self::with_impairments(fs, center_mhz, duration, Impairments::IDEAL, 1)
+    }
+
+    pub fn with_impairments(
+        fs: f64,
+        center_mhz: u32,
+        duration: f64,
+        imp: Impairments,
+        seed: u64,
+    ) -> Self {
         Self {
             fs,
             center_mhz,
             buf: vec![Complex32::new(0.0, 0.0); (duration * fs) as usize],
             gfsk: Gfsk::new(fs, 0.5),
+            imp,
+            rng: XorShift(seed.wrapping_mul(0xD1B5_4A32_D192_ED03).max(1)),
         }
     }
 
     /// Add a packet whose first bit starts at time `t` (s) on `freq_mhz`.
     pub fn add(&mut self, t: f64, freq_mhz: u32, bits: &[u8], dev_hz: f64, amp: f32, cfo_hz: f64) {
-        let wave = self.gfsk.modulate(bits, dev_hz);
+        let sym = |r: &mut XorShift| 2.0 * r.uniform() - 1.0;
+        let dev = dev_hz * (1.0 + sym(&mut self.rng) * self.imp.h_spread);
+        let drift = sym(&mut self.rng) * self.imp.drift_hz_per_us * 1e6; // Hz/s
+        let pn_step = self.imp.phase_noise * (1e6 / self.fs).sqrt();
+        let wave = self.gfsk.modulate(bits, dev);
         let start = (t * self.fs).round() as i64 - self.gfsk.ramp_samples() as i64;
         let f_off = (freq_mhz as f64 - self.center_mhz as f64) * 1e6 + cfo_hz;
+        let mut pn = 0.0f64;
         for (n, w) in wave.iter().enumerate() {
             let i = start + n as i64;
+            if pn_step > 0.0 {
+                pn += pn_step * self.rng.gauss_pair().0 as f64;
+            }
             if i < 0 || i as usize >= self.buf.len() {
                 continue;
             }
-            let ph = 2.0 * PI * f_off * i as f64 / self.fs;
+            let tt = n as f64 / self.fs;
+            let ph = 2.0 * PI * (f_off * i as f64 / self.fs + 0.5 * drift * tt * tt) + pn;
             let lo = Complex32::new(ph.cos() as f32, ph.sin() as f32);
             self.buf[i as usize] += w * lo * amp;
         }
@@ -333,9 +388,10 @@ pub fn demo_scenario(
     duration: f64,
     snr_db: f64,
     seed: u64,
+    imp: Impairments,
 ) -> (Vec<u8>, ScenarioInfo) {
     let fs = rate_mhz as f64 * 1e6;
-    let mut sc = Scene::new(fs, center_mhz, duration);
+    let mut sc = Scene::with_impairments(fs, center_mhz, duration, imp, seed);
     let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).max(1));
     let half = rate_mhz as i64 / 2 - 2;
     let lo = (center_mhz as i64 - half).max(2402) as u32;
@@ -343,7 +399,7 @@ pub fn demo_scenario(
     let amp = 0.25f32;
     // noise RMS for the requested SNR in a 1 MHz channel
     let noise_rms = amp / 10f32.powf(snr_db as f32 / 20.0) * (fs as f32 / 1e6).sqrt();
-    let cfo = |r: &mut XorShift| (r.uniform() - 0.5) * 60e3;
+    let cfo = |r: &mut XorShift| (2.0 * r.uniform() - 1.0) * imp.cfo_hz;
 
     let le_data_freqs: Vec<u32> = (lo..=hi)
         .filter(|&f| ble::rf_channel_from_mhz(f).is_some_and(|rf| !ble::is_primary_adv(rf)))
@@ -416,7 +472,7 @@ pub fn demo_scenario(
                 sc.add(t, f, &m_bits, BLE_DEV, amp, c);
                 let t2 = t + m_bits.len() as f64 * 1e-6 + 150e-6;
                 let s_bits = ble_packet_bits(info.conn_aa, info.conn_crc_init, &s_pdu, ci);
-                sc.add(t2, f, &s_bits, BLE_DEV, amp * 0.8, c + 5e3);
+                sc.add(t2, f, &s_bits, BLE_DEV, amp, c + 5e3);
                 info.conn_packets += 2;
                 sn = !sn;
                 k += 1;
@@ -465,7 +521,8 @@ pub fn demo_scenario(
         let slot = 625e-6;
         let clk0: u32 = 0x1234; // master clock (CLK) at t = 0, 312.5 us ticks
         let mut slot_idx = 3i64; // even slots: master
-        if (clk0 >> 1) & 1 == 1 {
+        // the master transmits in slots with CLK1 = 0
+        if (clk0.wrapping_add((slot_idx * 2) as u32) >> 1) & 1 == 1 {
             slot_idx += 1;
         }
         let mut seq = false;
@@ -504,7 +561,7 @@ pub fn demo_scenario(
                 0,
                 &[],
             );
-            sc.add(t + slot, f2, &bits, BR_DEV, amp * 0.7, cfo(&mut rng));
+            sc.add(t + slot, f2, &bits, BR_DEV, amp, cfo(&mut rng));
             info.br_packets += 1;
             seq = !seq;
             n += 1;
@@ -560,7 +617,7 @@ mod tests {
         let hdr = bits::to_u32(&h);
         assert!(bredr::header_valid(0x47, hdr));
         assert_eq!(bredr::uap_from_header(hdr), 0x47);
-        let pl = decode_payload(&bits[126..], 3, 0x47, 21).unwrap();
+        let pl = decode_payload(&bits[126..], &[], 3, 0x47, 21).unwrap();
         assert_eq!(pl.crc_valid, Some(true));
         assert_eq!(&pl.bytes[1..1 + body.len()], body);
     }

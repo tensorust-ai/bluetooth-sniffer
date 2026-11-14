@@ -30,6 +30,8 @@ pub struct BleConfig {
     pub rssi_offset: f32,
     /// Repeated (AA, CRCInit) observations needed to accept a discovered connection.
     pub discovery_hits: u32,
+    /// Repair packets with up to two bit errors using soft decisions.
+    pub crc_repair: bool,
 }
 
 impl Default for BleConfig {
@@ -40,6 +42,7 @@ impl Default for BleConfig {
             max_aa_errors: 2,
             rssi_offset: 0.0,
             discovery_hits: 3,
+            crc_repair: true,
         }
     }
 }
@@ -89,8 +92,13 @@ pub struct BleStats {
     pub adv_packets: u64,
     pub data_packets: u64,
     pub bad_crc: u64,
+    /// Packets whose CRC was made valid by flipping unreliable bits.
+    pub crc_repaired: u64,
     pub connections_seen: u64,
 }
+
+/// Number of least reliable bits considered by the CRC repair.
+const REPAIR_CANDIDATES: usize = 12;
 
 pub struct BleDecoder {
     cfg: BleConfig,
@@ -193,6 +201,57 @@ impl BleDecoder {
         }
     }
 
+    fn crc_init_for(&self, aa: u32) -> u32 {
+        if aa == ADV_AA {
+            crc_init_to_air(ADV_CRC_INIT)
+        } else {
+            self.connections[&aa].crc_init_air
+        }
+    }
+
+    /// Soft-decision CRC repair: flip the `REPAIR_CANDIDATES` least reliable
+    /// bits of the packet one and two at a time until the CRC passes.
+    /// With 78 trials the chance of accepting a wrong packet is ~5e-6.
+    fn repair(
+        bits: &[u8],
+        soft: &[f32],
+        p: usize,
+        ci: u8,
+        is_adv: bool,
+        init: u32,
+    ) -> Option<(Decoded, u8)> {
+        let (dec0, _) = Self::decode_at(bits, p, ci, is_adv, init)?;
+        let start = p + 40;
+        let end = dec0.end_bit.min(bits.len()).min(soft.len());
+        let mut idx: Vec<usize> = (start..end).collect();
+        idx.sort_by(|&a, &b| soft[a].abs().total_cmp(&soft[b].abs()));
+        idx.truncate(REPAIR_CANDIDATES);
+        let mut work = bits.to_vec();
+        let check = |w: &[u8]| {
+            Self::decode_at(w, p, ci, is_adv, init)
+                .and_then(|(d, calc)| (calc == d.crc_rx).then_some(d))
+        };
+        for &i in &idx {
+            work[i] ^= 1;
+            if let Some(d) = check(&work) {
+                return Some((d, 1));
+            }
+            work[i] ^= 1;
+        }
+        for (k, &i) in idx.iter().enumerate() {
+            work[i] ^= 1;
+            for &j in &idx[k + 1..] {
+                work[j] ^= 1;
+                if let Some(d) = check(&work) {
+                    return Some((d, 2));
+                }
+                work[j] ^= 1;
+            }
+            work[i] ^= 1;
+        }
+        None
+    }
+
     /// De-whiten and parse a packet whose preamble starts at bit `p`.
     fn decode_at(
         bits: &[u8],
@@ -263,6 +322,7 @@ impl BleDecoder {
             noise_dbm: clamp_i8(info.noise_db + self.cfg.rssi_offset),
             direction: Direction::Unknown,
             cfo_hz: d.cfo_hz,
+            bits_corrected: 0,
         }
     }
 
@@ -323,24 +383,36 @@ impl BleDecoder {
         }
         matches.sort_by_key(|&(e, p, _)| (e, p));
         let mut bad: Option<BlePacket> = None;
+        let mut chosen = None;
         for &(e, p, aa) in &matches {
             let is_adv = aa == ADV_AA;
-            let init = if is_adv {
-                crc_init_to_air(ADV_CRC_INIT)
-            } else {
-                self.connections[&aa].crc_init_air
-            };
+            let init = self.crc_init_for(aa);
             let Some((dec, calc)) = Self::decode_at(bits, p, ci, is_adv, init) else {
                 continue;
             };
-            let ok = calc == dec.crc_rx;
-            let mut pkt = self.make_packet(d, info, rf, p, aa, &dec, ok, e);
-            if !ok {
-                if bad.is_none() {
-                    bad = Some(pkt);
-                }
-                continue;
+            if calc == dec.crc_rx {
+                chosen = Some((e, p, aa, dec, 0u8));
+                break;
             }
+            if bad.is_none() {
+                bad = Some(self.make_packet(d, info, rf, p, aa, &dec, false, e));
+            }
+        }
+        if chosen.is_none() && self.cfg.crc_repair {
+            // Second pass: flip the least reliable bits of the best candidates.
+            for &(e, p, aa) in matches.iter().take(2) {
+                let init = self.crc_init_for(aa);
+                if let Some((dec, fixed)) = Self::repair(bits, &d.soft, p, ci, aa == ADV_AA, init) {
+                    self.stats.crc_repaired += 1;
+                    chosen = Some((e, p, aa, dec, fixed));
+                    break;
+                }
+            }
+        }
+        if let Some((e, p, aa, dec, fixed)) = chosen {
+            let is_adv = aa == ADV_AA;
+            let mut pkt = self.make_packet(d, info, rf, p, aa, &dec, true, e);
+            pkt.bits_corrected = fixed;
             let end_time = d.bit_time(dec.end_bit);
             if is_adv {
                 self.stats.adv_packets += 1;
@@ -482,4 +554,62 @@ impl BleDecoder {
 
 pub fn clamp_i8(v: f32) -> i8 {
     v.round().clamp(-127.0, 127.0) as i8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::synth;
+
+    fn demod_of(bits: Vec<u8>, soft: Vec<f32>, core: (usize, usize)) -> Demodulated {
+        Demodulated {
+            bits,
+            soft,
+            t0: 0.0,
+            core_start_bit: core.0,
+            core_end_bit: core.1,
+            cfo_hz: 0.0,
+            deviation_hz: 200e3,
+        }
+    }
+
+    #[test]
+    fn soft_repair_fixes_two_weak_bit_errors() {
+        let pdu = synth::adv_ind(synth::DEMO_ADV_ADDR, "repair");
+        let pkt = synth::ble_packet_bits(ADV_AA, ADV_CRC_INIT, &pdu, 38);
+        let mut bits = vec![0u8; 20];
+        bits.extend(&pkt);
+        bits.extend(vec![0u8; 20]);
+        let mut soft: Vec<f32> = bits
+            .iter()
+            .map(|&b| if b == 1 { 200e3 } else { -200e3 })
+            .collect();
+        // two errors inside the PDU, both with low confidence
+        for i in [100usize, 180] {
+            bits[i] ^= 1;
+            soft[i] = if bits[i] == 1 { 10e3 } else { -10e3 };
+        }
+        let core = (20, 20 + pkt.len());
+        let info = BurstInfo {
+            freq_mhz: 2426,
+            signal_db: -30.0,
+            noise_db: -60.0,
+        };
+
+        let mut dec = BleDecoder::new(BleConfig::default());
+        let mut out = Vec::new();
+        assert!(dec.process(&demod_of(bits.clone(), soft.clone(), core), &info, &mut out));
+        assert_eq!(out[0].pdu, pdu);
+        assert!(out[0].crc_valid);
+        assert_eq!(out[0].bits_corrected, 2);
+        assert_eq!(dec.stats.crc_repaired, 1);
+
+        let mut dec = BleDecoder::new(BleConfig {
+            crc_repair: false,
+            ..Default::default()
+        });
+        let mut out = Vec::new();
+        assert!(!dec.process(&demod_of(bits, soft, core), &info, &mut out));
+        assert_eq!(dec.stats.bad_crc, 1);
+    }
 }

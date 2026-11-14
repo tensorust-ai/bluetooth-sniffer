@@ -294,13 +294,13 @@ pub fn run(
         };
         if let Some(burst) = burst {
             stats.bursts += 1;
+            let info = BurstInfo {
+                freq_mhz: burst.freq_mhz,
+                signal_db: burst.signal_db,
+                noise_db: burst.noise_db,
+            };
             if let Some(d) = demod.demodulate(&burst) {
                 last_t = d.t0;
-                let info = BurstInfo {
-                    freq_mhz: burst.freq_mhz,
-                    signal_db: burst.signal_db,
-                    noise_db: burst.noise_db,
-                };
                 let mut found = false;
                 if let Some(b) = br.as_mut() {
                     found = b.process(&d, &info, &mut br_pkts);

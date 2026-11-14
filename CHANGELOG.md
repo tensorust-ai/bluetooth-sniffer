@@ -24,3 +24,15 @@ First release.
 - `synth` command and an end-to-end test suite built on synthetic signals.
 - Wireshark extcap integration: `btsdr extcap install` registers three
   capture interfaces (LE + BR/EDR, LE only, BR only) with a settings dialog.
+- Sensitivity improvements, measured with the new `examples/benchmark.rs`.
+  At 50% decoding they gain about 2.5 dB for LE advertising and about 3 dB
+  for BR headers:
+  - narrower channel filter (±0.6 MHz);
+  - soft-decision CRC repair for LE (up to two bit errors);
+  - soft majority header decoding and Chase decoding of the rate-2/3 FEC
+    for BR;
+  - more robust piconet UAP/clock lock (partial-alias aware, POLL slot
+    rule).
+
+  `--hard-decisions` restores the previous behaviour for comparison.
+- `btsdr synth --impaired` adds realistic radio impairments.

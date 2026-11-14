@@ -65,8 +65,11 @@ So each output vector costs:
 Only the bins that map to selected channels are kept.
 
 - **Prototype filter:** Kaiser-windowed sinc, 65 dB stop band, −6 dB at
-  ±0.8 MHz. It passes the ~1.5 MHz wide LE signal and stops before the
-  2 MHz output Nyquist band.
+  ±0.6 MHz. This is narrower than the LE signal's ~1.5 MHz occupied
+  bandwidth, but the benchmark shows it is the best choice for both LE
+  (h = 0.5) and BR (h = 0.32). Less noise reaches the burst detector and the
+  discriminator, while the GFSK main lobe passes; against ±0.8 MHz the LE
+  50% point improves by ~1.5 dB. The output Nyquist band is 2 MHz.
 - **DC removal:** the HackRF LO leakage would land in the centre channel.
   It is removed with a block-mean estimate smoothed across blocks.
 - **Edge channels:** channels within 2 MHz of the band edge are skipped by
@@ -122,7 +125,8 @@ h ≈ 0.5 for LE and 0.28–0.35 for BR. Per burst:
 7. **Slicing:** a positive deviation is a 1, as both specifications define.
 
 The output carries:
-- hard bits and soft values;
+- hard bits and soft values (the CFO-corrected frequency at each decision
+  point, in Hz; its magnitude is the bit's reliability);
 - the time of bit 0;
 - the bit range of the energy core.
 
@@ -170,7 +174,14 @@ just before the energy onset up to 80 bits after it.
    A (AA, CRCInit) pair seen 3 times becomes a tracked connection. Its
    buffered packets are released with valid-CRC flags (they are consistent
    by construction).
-4. **Direction.** Within a connection event the peripheral answers 150 µs
+4. **Soft-decision CRC repair.** If no candidate passes the CRC, the
+   decoder takes the 12 bits of the packet with the smallest |soft| value
+   (header to CRC). It flips them one at a time, then in pairs (78 trials),
+   until the CRC passes. Header bits are included, so a corrupted length
+   field can be repaired as well. With a 24-bit CRC the probability of
+   accepting a wrong packet is about 78 × 2⁻²⁴ ≈ 5·10⁻⁶ per repaired packet.
+   Repaired packets report the number of corrected bits.
+5. **Direction.** Within a connection event the peripheral answers 150 µs
    (T_IFS) after the central's packet on the same channel. A packet starting
    150 ± 10 µs after the previous packet of the same connection on the same
    channel is attributed to the other side; anything else starts a new
@@ -198,7 +209,8 @@ The LAP is then read from bits 34–57. Packets whose energy lasts less than
 ### Header
 
 The 18-bit header (LT_ADDR, TYPE, FLOW, ARQN, SEQN, HEC) is sent with
-rate-1/3 repetition coding and majority-decoded. It is whitened with the
+rate-1/3 repetition coding. It is decoded by soft majority: each bit is the
+sign of the sum of its three soft values. It is whitened with the
 same 7-bit LFSR, initialised with the master's clock bits CLK6-1 (CLK1 in
 position 0, position 6 = 1). The header error check is an 8-bit CRC
 (polynomial 0xA7) initialised with the UAP. Bit orders match Wireshark's
@@ -222,10 +234,18 @@ The UAP and CLK6-1 are not transmitted in clear, but they can be recovered:
   vote: NULL/POLL ≈ 126 µs, FHS ≈ 366 µs, single-slot ≤ 366 µs, and so on.
   A pair whose payload decodes with a valid CRC-16 gets weight 5 instead
   of 1.
-- **Locking.** The true pair gains one vote per packet; wrong pairs collect
-  votes only by chance. The piconet locks when the best cell has ≥ 6 votes
-  and at least 3× the runner-up: typically one CRC packet plus one more, or
-  about six header-only packets.
+- **Protocol rule.** POLL is only sent by the master, and the master only
+  transmits in slots with CLK1 = 0. Hypotheses that would put a POLL into a
+  slave slot do not vote.
+- **Partial aliases.** Whitening is linear: for clock pairs `c`, `c + δ` the
+  mask difference is constant for a subset of `c` values. A few wrong
+  (UAP, clock) pairs therefore collect votes from a fixed fraction of the
+  packets, up to ~40% in tests.
+- **Locking.** The true pair gains one vote from nearly every packet. The
+  piconet locks when the best cell either has ≥ 6 votes and 3× the
+  runner-up, or has ≥ 8 votes, at least 60% of the packets that voted, and
+  1.5× the runner-up. Typically this takes one CRC packet plus one more, or
+  about six to eight header-only packets.
 - **Restart.** Votes are reset after 8 s without a lock, because the slot
   grid drifts against the receiver clock.
 
@@ -253,9 +273,11 @@ carry the responding device's full BD_ADDR, class of device and clock.
 Supported types are FHS, DM1, DH1, DM3, DH3, DM5 and DH5:
 
 1. **FEC.** Decode the rate-2/3 FEC ((15,10) shortened Hamming code,
-   g(D) = D⁵+D⁴+D²+1, single-error correction per block) where the type
-   uses it. Only as many blocks as the payload header announces are
-   decoded.
+   g(D) = D⁵+D⁴+D²+1) where the type uses it. Single errors are corrected
+   algebraically. Blocks with an uncorrectable syndrome are Chase-decoded:
+   all 7 combinations of their three least reliable bits are flipped, and
+   the candidate code word nearest to the soft values wins. Only as many
+   blocks as the payload header announces are decoded.
 2. **De-whitening.** Continue the header's whitening sequence (offset 18).
 3. **Payload header.** Parse it: 1 byte with a 5-bit length for single-slot
    packets, 2 bytes with a 10-bit length for multi-slot packets.
@@ -351,6 +373,10 @@ executable there and checks that the copy answers `--extcap-interfaces`.
   `synth.rs` produces LE advertising, an announced and a hidden connection,
   a BR piconet and inquiry traffic. The whole pipeline must decode it at
   25 dB SNR and degrade gracefully at 14 dB.
+- **Sensitivity benchmark** (`examples/benchmark.rs`): packet success rate
+  versus SNR on synthetic captures with impairments within the
+  specification limits (carrier offset and drift, modulation index spread,
+  phase noise). The results are in the README.
 - **Live tests with a HackRF One:**
   - LE advertising (CRC-valid packets from phones, printers and other nearby
     devices);

@@ -141,6 +141,24 @@ pub fn fec13_decode(coded: &[u8]) -> (Vec<u8>, u32) {
     (out, errors)
 }
 
+/// Soft majority decoding of the rate 1/3 code: each bit is the sign of the
+/// sum of its three soft values. Returns the bits and the number of triplets
+/// whose hard decisions disagreed.
+pub fn fec13_decode_soft(soft: &[f32]) -> (Vec<u8>, u32) {
+    let mut errors = 0;
+    let out = soft
+        .chunks_exact(3)
+        .map(|c| {
+            let hard = c.iter().filter(|&&v| v > 0.0).count();
+            if hard == 1 || hard == 2 {
+                errors += 1;
+            }
+            (c[0] + c[1] + c[2] > 0.0) as u8
+        })
+        .collect();
+    (out, errors)
+}
+
 /// (15,10) shortened Hamming code, g(D) = D^5 + D^4 + D^2 + 1.
 const FEC23_G: u16 = 0b110101;
 
@@ -188,6 +206,55 @@ fn fec23_syndrome_table() -> &'static [Option<u16>; 32] {
         }
         t
     })
+}
+
+/// Soft-decision (Chase-2) decoding of the rate 2/3 FEC. Blocks the
+/// algebraic decoder cannot correct are retried with every combination of
+/// their three least reliable bits flipped; the candidate code word closest
+/// to the received soft values wins. Falls back to hard decoding when no
+/// soft values are available.
+pub fn fec23_decode_soft(coded: &[u8], soft: &[f32]) -> Option<(Vec<u8>, u32)> {
+    if soft.len() < coded.len() {
+        return fec23_decode(coded);
+    }
+    let table = fec23_syndrome_table();
+    let syndrome = |w: u16| fec23_parity(w & 0x3FF) ^ ((w >> 10) & 0x1F);
+    let mut out = Vec::with_capacity(coded.len() * 2 / 3);
+    let mut corrected = 0;
+    for (block, sb) in coded.chunks_exact(15).zip(soft.chunks_exact(15)) {
+        let hard = bits::to_u64(block) as u16;
+        let fixed = if let Some(e) = table[syndrome(hard) as usize] {
+            hard ^ e
+        } else {
+            let mut order: Vec<usize> = (0..15).collect();
+            order.sort_by(|&a, &b| sb[a].abs().total_cmp(&sb[b].abs()));
+            let mut best: Option<(f32, u16)> = None;
+            for pattern in 1u16..8 {
+                let mut w = hard;
+                for (k, &pos) in order.iter().take(3).enumerate() {
+                    if pattern & (1 << k) != 0 {
+                        w ^= 1 << pos;
+                    }
+                }
+                let Some(e) = table[syndrome(w) as usize] else {
+                    continue;
+                };
+                let cand = w ^ e;
+                let diff = cand ^ hard;
+                let metric: f32 = (0..15)
+                    .filter(|i| diff & (1 << i) != 0)
+                    .map(|i| sb[i].abs())
+                    .sum();
+                if best.is_none_or(|(m, _)| metric < m) {
+                    best = Some((metric, cand));
+                }
+            }
+            best?.1
+        };
+        corrected += (fixed ^ hard).count_ones();
+        bits::push_bits(&mut out, (fixed & 0x3FF) as u64, 10);
+    }
+    Some((out, corrected))
 }
 
 /// Decode the rate 2/3 FEC, correcting single-bit errors per 15-bit block.
@@ -446,6 +513,34 @@ mod tests {
             }
             assert_eq!(fec23_parity(d), cw >> 10, "data {d:03x}");
         }
+    }
+
+    #[test]
+    fn fec23_soft_corrects_double_errors() {
+        let data: Vec<u8> = (0..30).map(|i| ((i * 5 + 1) % 3 == 0) as u8).collect();
+        let coded = fec23_encode(&data);
+        // soft values: confident everywhere except the two flipped bits
+        let mut soft: Vec<f32> = coded
+            .iter()
+            .map(|&b| if b == 1 { 1.0 } else { -1.0 })
+            .collect();
+        let mut rx = coded.clone();
+        for &i in &[2usize, 9, 17, 20] {
+            rx[i] ^= 1;
+            soft[i] = if rx[i] == 1 { 0.1 } else { -0.1 };
+        }
+        assert!(fec23_decode(&rx).is_none_or(|(d, _)| d != data));
+        let (dec, corrected) = fec23_decode_soft(&rx, &soft).unwrap();
+        assert_eq!(dec, data);
+        assert_eq!(corrected, 4);
+    }
+
+    #[test]
+    fn fec13_soft_majority() {
+        // two weak wrong votes are outvoted by one strong correct one
+        let (b, e) = fec13_decode_soft(&[0.1, 0.2, -2.0, 1.0, 1.0, 1.0]);
+        assert_eq!(b, vec![0, 1]);
+        assert_eq!(e, 1);
     }
 
     #[test]

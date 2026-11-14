@@ -35,7 +35,8 @@ impl PacketSink for Collect {
 }
 
 fn run(snr_db: f64, seed: u64) -> (Collected, ScenarioInfo) {
-    let (data, info) = synth::demo_scenario(2426, 20, 0.25, snr_db, seed);
+    let (data, info) =
+        synth::demo_scenario(2426, 20, 0.25, snr_db, seed, synth::Impairments::IDEAL);
     let cfg = CaptureConfig {
         center_mhz: 2426,
         sample_rate_mhz: 20,

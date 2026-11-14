@@ -57,9 +57,11 @@ impl Channelizer {
             "oversampling must divide M"
         );
         let l = m * taps_per_branch;
-        // Pass +-0.75 channel spacings (LE signals are ~1.5 MHz wide), stop at
-        // the output Nyquist frequency (os/2 spacings).
-        let cutoff = 0.8 / m as f64;
+        // -6 dB at +-0.6 channel spacings. Measured with the synthetic
+        // benchmark this beats wider filters for both LE (h = 0.5) and BR
+        // (h = 0.32): less noise reaches the discriminator and the burst
+        // detector, while the GFSK main lobe still passes.
+        let cutoff = 0.6 / m as f64;
         let proto = filter::lowpass(l, cutoff, filter::kaiser_beta(65.0));
         let taps_rev: Vec<f32> = proto.iter().rev().copied().collect();
         let mut planner = FftPlanner::new();
