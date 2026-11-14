@@ -3,6 +3,7 @@ name = "btsdr"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+authors = ["Przemysław Frasunek <przemyslaw@frasunek.com>"]
 description = "Bluetooth LE and BR (Classic) baseband sniffer for the HackRF One, with PCAP/PCAPNG output for Wireshark"
 license = "MIT"
 repository = "https://github.com/venglin/bluetooth-sniffer"
