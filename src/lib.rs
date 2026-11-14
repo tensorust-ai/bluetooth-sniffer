@@ -8,11 +8,14 @@
 //! 4. [`dsp::demod`] demodulates GFSK bursts into bits.
 //! 5. [`ble`] and [`bredr`] recover link-layer packets.
 //! 6. [`pcap`] writes them for Wireshark; [`report`] prints them.
+//!
+//! [`extcap`] lets Wireshark run btsdr directly as a capture interface.
 
 pub mod bits;
 pub mod ble;
 pub mod bredr;
 pub mod dsp;
+pub mod extcap;
 pub mod pcap;
 pub mod pipeline;
 pub mod report;

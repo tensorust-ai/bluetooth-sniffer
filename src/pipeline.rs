@@ -10,12 +10,13 @@ use crate::pcap::PacketSink;
 use crate::report::Reporter;
 use crate::source::{IqBlock, IqSource, SourceStats};
 use anyhow::{Context, bail};
+use crossbeam_channel::RecvTimeoutError;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Oversampling of the channelizer outputs (2 samples per 1 Msym/s symbol).
 pub const OVERSAMPLE: usize = 2;
@@ -283,23 +284,32 @@ pub fn run(
         Ok(())
     };
 
-    for burst in rx_burst.iter() {
-        stats.bursts += 1;
-        let Some(d) = demod.demodulate(&burst) else {
-            continue;
+    let mut last_keepalive = Instant::now();
+    let mut last_t = 0.0;
+    loop {
+        let burst = match rx_burst.recv_timeout(Duration::from_millis(250)) {
+            Ok(b) => Some(b),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
-        let info = BurstInfo {
-            freq_mhz: burst.freq_mhz,
-            signal_db: burst.signal_db,
-            noise_db: burst.noise_db,
-        };
-        let mut found = false;
-        if let Some(b) = br.as_mut() {
-            found = b.process(&d, &info, &mut br_pkts);
-        }
-        if !found {
-            if let Some(b) = ble.as_mut() {
-                b.process(&d, &info, &mut ble_pkts);
+        if let Some(burst) = burst {
+            stats.bursts += 1;
+            if let Some(d) = demod.demodulate(&burst) {
+                last_t = d.t0;
+                let info = BurstInfo {
+                    freq_mhz: burst.freq_mhz,
+                    signal_db: burst.signal_db,
+                    noise_db: burst.noise_db,
+                };
+                let mut found = false;
+                if let Some(b) = br.as_mut() {
+                    found = b.process(&d, &info, &mut br_pkts);
+                }
+                if !found {
+                    if let Some(b) = ble.as_mut() {
+                        b.process(&d, &info, &mut ble_pkts);
+                    }
+                }
             }
         }
         if let Some(b) = ble.as_mut() {
@@ -313,13 +323,23 @@ pub fn run(
             }
         }
         if sink_error.is_none() {
-            if let Err(e) = emit(
+            let mut r = emit(
                 &mut ble_pkts,
                 &mut br_pkts,
                 reporter,
                 &mut sinks,
                 &mut stats,
-            ) {
+            );
+            // Periodic keep-alive lets a pipe reader (Wireshark extcap)
+            // that went away be noticed even when no packets arrive.
+            if r.is_ok() && last_keepalive.elapsed() >= Duration::from_secs(1) {
+                last_keepalive = Instant::now();
+                r = sinks
+                    .iter_mut()
+                    .try_for_each(|s| s.keepalive(ts(last_t)))
+                    .map_err(Into::into);
+            }
+            if let Err(e) = r {
                 sink_error = Some(e.context("writing capture output"));
                 stop.store(true, Ordering::Relaxed);
             }
@@ -333,7 +353,7 @@ pub fn run(
                 reporter.flush();
                 reporter.status(&format!(
                     "[{:>8.1} s] bursts {} | BLE {} | BR {} | queue {}",
-                    d.t0,
+                    last_t,
                     stats.bursts,
                     stats.ble_packets,
                     stats.br_packets,

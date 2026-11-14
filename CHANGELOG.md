@@ -22,3 +22,5 @@ First release.
 - PCAPNG (LE + BR/EDR) and PCAP output for Wireshark, including live
   streaming to stdout.
 - `synth` command and an end-to-end test suite built on synthetic signals.
+- Wireshark extcap integration: `btsdr extcap install` registers three
+  capture interfaces (LE + BR/EDR, LE only, BR only) with a settings dialog.

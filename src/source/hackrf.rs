@@ -273,6 +273,8 @@ pub struct HackRfConfig {
     pub vga_gain: u32,
     pub amp: bool,
     pub bias_tee: bool,
+    /// Print device settings and warnings on stderr.
+    pub verbose: bool,
 }
 
 pub struct HackRfSource {
@@ -383,16 +385,18 @@ impl IqSource for HackRfSource {
                     "set_antenna_enable",
                     (api.set_antenna_enable)(dev, c.bias_tee as u8),
                 )?;
-                eprintln!(
-                    "HackRF: {} | {:.3} MHz, {:.1} Msps, baseband filter {:.2} MHz, LNA {} dB, VGA {} dB, amp {}",
-                    api.path,
-                    c.center_hz as f64 / 1e6,
-                    c.sample_rate / 1e6,
-                    bw as f64 / 1e6,
-                    c.lna_gain,
-                    c.vga_gain,
-                    if c.amp { "on" } else { "off" }
-                );
+                if c.verbose {
+                    eprintln!(
+                        "HackRF: {} | {:.3} MHz, {:.1} Msps, baseband filter {:.2} MHz, LNA {} dB, VGA {} dB, amp {}",
+                        api.path,
+                        c.center_hz as f64 / 1e6,
+                        c.sample_rate / 1e6,
+                        bw as f64 / 1e6,
+                        c.lna_gain,
+                        c.vga_gain,
+                        if c.amp { "on" } else { "off" }
+                    );
+                }
                 api.check("start_rx", (api.start_rx)(dev, rx_callback, ctx_ptr))?;
                 while !stop.load(Ordering::Relaxed) && (api.is_streaming)(dev) == 1 {
                     std::thread::sleep(Duration::from_millis(50));
@@ -405,6 +409,7 @@ impl IqSource for HackRfSource {
                     dropped: ctx.dropped.load(Ordering::Relaxed),
                 };
                 if streaming_ended {
+                    // Not silent even in extcap mode: Wireshark should show it.
                     eprintln!("HackRF: streaming stopped unexpectedly (device disconnected?)");
                 }
                 Ok(st)

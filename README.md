@@ -53,6 +53,8 @@ HackRF One ──► channelizer (PFB) ──► burst detector ──► GFSK d
 - PCAPNG with both link types in one file, or separate PCAP files:
   `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR` (256) and `LINKTYPE_BLUETOOTH_BREDR_BB` (255).
 - Live streaming into Wireshark through stdout.
+- Wireshark extcap plugin: choose the HackRF in Wireshark's interface list,
+  configure it in the GUI and start or stop captures from there.
 - Raw IQ recording and offline re-analysis of `ci8`, `cu8`, `ci16` and
   `cf32` files.
 - A built-in synthetic signal generator lets you try everything without
@@ -158,6 +160,60 @@ The BR flags `F`, `A` and `S` are FLOW, ARQN and SEQN. Lines starting with
 `#` are events. A summary of devices, connections and piconets is printed at
 the end.
 
+## Capturing directly from Wireshark (extcap)
+
+btsdr can register itself as a Wireshark *extcap* interface, so HackRF
+captures are started, configured and stopped from Wireshark itself:
+
+```bash
+btsdr extcap install
+```
+
+This copies the btsdr executable into Wireshark's personal extcap folder.
+btsdr asks Wireshark for the location with `tshark -G folders`; typical
+locations are `%APPDATA%\Wireshark\extcap` on Windows and
+`~/.local/lib/wireshark/extcap` on Linux and macOS (Wireshark 4.4+).
+
+Restart Wireshark or use *Capture > Refresh Interfaces*. Three interfaces
+appear:
+
+| Interface | Captures |
+|-----------|----------|
+| Bluetooth LE + BR/EDR sniffer (HackRF One) | both, as two interfaces in one PCAPNG stream |
+| Bluetooth LE sniffer (HackRF One) | LE only |
+| Bluetooth BR/EDR sniffer (HackRF One) | BR only |
+
+The gear icon next to an interface opens its settings:
+- centre frequency, sample rate and channel list;
+- LNA/VGA gain and the RF amplifier;
+- squelch and decoder options;
+- HackRF serial number, bias tee, libhackrf path and an optional raw IQ
+  recording.
+
+Start the capture as usual. Stopping it in Wireshark stops btsdr and
+releases the HackRF.
+
+The same works from the command line:
+
+```bash
+tshark -i btsdr -o extcap.btsdr.center:2472 -o extcap.btsdr.lna:24
+```
+
+Notes:
+- **Updates:** the extcap folder holds a *copy* of the binary. Run
+  `btsdr extcap install` again after updating btsdr.
+- **Other commands:** `btsdr extcap uninstall` removes the copy and
+  `btsdr extcap path` shows the folder. `--dir <folder>` installs elsewhere,
+  for example into the global extcap folder.
+- **tshark preferences:** for the LE-only and BR-only interfaces they are
+  named `extcap.btsdr_le.*` and `extcap.btsdr_bredr.*`.
+- **Filters:** capture filters are not supported; use display filters.
+- **Errors:** if the HackRF cannot be opened, Wireshark shows btsdr's error
+  message. On Linux the user running Wireshark needs access to the HackRF
+  (udev rules, `plugdev` group).
+- **Manual installation:** copy the btsdr executable into the folder shown
+  under *Help > About Wireshark > Folders > Personal Extcap path*.
+
 ## Choosing the frequency
 
 A HackRF sees at most 20 MHz, so pick the slice of the band you care about.
@@ -232,6 +288,17 @@ Writes a synthetic `ci8` recording containing:
 
 Options: `-o <file>`, `-f <MHz>`, `-s <Msps>`, `-t <seconds>`, `--snr <dB>`,
 `--seed <n>`.
+
+### `btsdr extcap`
+
+| Command | Description |
+|---------|-------------|
+| `btsdr extcap install [--dir <folder>]` | Copy btsdr into Wireshark's personal extcap folder |
+| `btsdr extcap uninstall [--dir <folder>]` | Remove it again |
+| `btsdr extcap path` | Show the extcap folder |
+
+When Wireshark starts btsdr with `--extcap-*` options, btsdr speaks the
+extcap protocol instead of its normal command line.
 
 ## Working with the captures in Wireshark
 
@@ -333,6 +400,7 @@ src/
   ble/               LE link layer: codec, connection tracking
   bredr/             BR baseband: codec, piconet UAP/clock discovery
   pcap.rs            PCAP / PCAPNG writers
+  extcap.rs          Wireshark extcap interface and installer
   report.rs          console output and summary
   synth.rs           packet encoders, GFSK modulator, demo scenario
 tests/synthetic.rs   end-to-end test

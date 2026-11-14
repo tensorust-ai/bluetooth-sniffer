@@ -27,6 +27,7 @@ pub struct Reporter {
     out: Box<dyn Write + Send>,
     quiet: bool,
     show_bad: bool,
+    print_summary: bool,
     ble_devices: BTreeMap<[u8; 6], BleDevice>,
     br_devices: BTreeMap<String, BrDevice>,
     pub ble_count: u64,
@@ -53,6 +54,7 @@ impl Reporter {
             out,
             quiet,
             show_bad,
+            print_summary: true,
             ble_devices: BTreeMap::new(),
             br_devices: BTreeMap::new(),
             ble_count: 0,
@@ -140,7 +142,15 @@ impl Reporter {
         let _ = self.out.flush();
     }
 
+    /// Disable the end-of-capture summary on stderr (extcap mode).
+    pub fn set_print_summary(&mut self, on: bool) {
+        self.print_summary = on;
+    }
+
     pub fn summary(&mut self, ble: Option<&BleDecoder>, br: Option<&BrDecoder>) {
+        if !self.print_summary {
+            return;
+        }
         let mut s = String::new();
         s += "\n=== Summary ===\n";
         if let Some(b) = ble {

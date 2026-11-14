@@ -43,6 +43,29 @@ enum Cmd {
     },
     /// Generate a synthetic IQ recording with LE and BR traffic (no hardware needed)
     Synth(SynthArgs),
+    /// Install or remove btsdr as a Wireshark extcap capture interface
+    Extcap {
+        #[command(subcommand)]
+        action: ExtcapAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExtcapAction {
+    /// Copy btsdr into Wireshark's personal extcap folder
+    Install {
+        /// Install into this folder instead
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Remove btsdr from Wireshark's personal extcap folder
+    Uninstall {
+        /// Remove from this folder instead
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Show Wireshark's personal extcap folder
+    Path,
 }
 
 #[derive(Args)]
@@ -163,27 +186,6 @@ struct SynthArgs {
     seed: u64,
 }
 
-fn parse_channels(spec: &str) -> anyhow::Result<Vec<u32>> {
-    let mut v = Vec::new();
-    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some((a, b)) = part.split_once('-') {
-            let (a, b): (u32, u32) = (a.trim().parse()?, b.trim().parse()?);
-            if a > b {
-                bail!("bad channel range {part}");
-            }
-            v.extend(a..=b);
-        } else {
-            v.push(
-                part.parse()
-                    .with_context(|| format!("bad channel {part}"))?,
-            );
-        }
-    }
-    v.sort_unstable();
-    v.dedup();
-    Ok(v)
-}
-
 fn parse_hex_pair(s: &str, what: &str) -> anyhow::Result<(u32, u32)> {
     let (a, b) = s
         .split_once(':')
@@ -203,7 +205,7 @@ fn open_output(path: &Path) -> anyhow::Result<(Box<dyn Write + Send>, bool)> {
 
 fn capture(a: CaptureArgs) -> anyhow::Result<()> {
     let channels = match &a.channels {
-        Some(s) => parse_channels(s)?,
+        Some(s) => btsdr::extcap::parse_channel_list(s)?,
         None => CaptureConfig::default_channels(a.center, a.rate),
     };
     let mut sinks: Vec<Box<dyn PacketSink>> = Vec::new();
@@ -276,6 +278,7 @@ fn capture(a: CaptureArgs) -> anyhow::Result<()> {
             vga_gain: a.vga.min(62) / 2 * 2,
             amp: a.amp,
             bias_tee: a.bias_tee,
+            verbose: true,
         })),
     };
     let wall_start_ns = SystemTime::now()
@@ -386,12 +389,50 @@ fn synth(a: SynthArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn extcap_cmd(action: ExtcapAction) -> anyhow::Result<()> {
+    match action {
+        ExtcapAction::Install { dir } => {
+            let dest = btsdr::extcap::install(dir.as_deref())?;
+            println!("Installed {}", dest.display());
+            println!(
+                "Restart Wireshark (or use Capture > Refresh Interfaces) and pick one of the interfaces:"
+            );
+            for i in &btsdr::extcap::INTERFACES {
+                println!("  {} ({})", i.display, i.value);
+            }
+            println!("Re-run this command after updating btsdr; the extcap folder holds a copy.");
+        }
+        ExtcapAction::Uninstall { dir } => match btsdr::extcap::uninstall(dir.as_deref())? {
+            Some(p) => println!("Removed {}", p.display()),
+            None => println!("btsdr is not installed there"),
+        },
+        ExtcapAction::Path => {
+            let (dir, from_wireshark) = btsdr::extcap::personal_extcap_dir()?;
+            println!("{}", dir.display());
+            if !from_wireshark {
+                eprintln!(
+                    "(guessed: tshark was not found; check Help > About Wireshark > Folders > Personal Extcap path)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() {
+    // Wireshark runs extcap tools with --extcap-* options instead of a subcommand.
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if btsdr::extcap::is_extcap_invocation(&args) {
+        std::process::exit(btsdr::extcap::main(&args));
+    }
     let cli = Cli::parse();
     let r = match cli.cmd {
         Cmd::Capture(a) => capture(a),
         Cmd::Devices { hackrf_lib } => devices(hackrf_lib),
         Cmd::Synth(a) => synth(a),
+        Cmd::Extcap { action } => extcap_cmd(action),
     };
     if let Err(e) = r {
         eprintln!("error: {e:#}");

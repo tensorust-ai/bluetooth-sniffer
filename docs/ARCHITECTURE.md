@@ -302,6 +302,39 @@ little-endian.
 | flags | de-whitened, signal and noise valid, reference LAP valid, reference UAP valid, HEC checked and valid, CRC checked and valid, payload present, and decrypted (set for CRC-valid payloads so Wireshark dissects them) |
 | payload | payload header + body + CRC, air bit order |
 
+### Wireshark extcap (`extcap.rs`)
+
+When started with any `--extcap-*` option, btsdr implements Wireshark's
+extcap protocol instead of its normal command line:
+
+| Call | Answer |
+|------|--------|
+| `--extcap-interfaces` | three interfaces: `btsdr` (LE + BR/EDR), `btsdr-le`, `btsdr-bredr` |
+| `--extcap-interface X --extcap-dlts` | the interface's (first) link type |
+| `--extcap-interface X --extcap-config` | 13 options grouped in the "Radio", "Gain", "Decoder" and "Device" tabs |
+| `--extcap-interface X --capture --fifo P [options]` | a PCAPNG stream written into the FIFO / named pipe `P` |
+
+How the capture behaves:
+- **Format:** the stream is PCAPNG. The combined interface carries two
+  interface description blocks; dumpcap (Wireshark 4.x) keeps them, so LE
+  and BR/EDR packets keep their own link types.
+- **Silence:** nothing is printed on stderr during a normal capture.
+  Wireshark shows stderr output as an error, so only real problems (for
+  example, no HackRF) reach the user.
+- **Unknown options are ignored,** so newer Wireshark versions can add their
+  own.
+
+Wireshark stops an extcap tool by sending SIGTERM (Unix) or by closing the
+pipe. The `termination` feature of `ctrlc` turns SIGTERM into the normal
+stop path. A closed pipe surfaces as a write error. Even when no packets
+are captured, an empty Interface Statistics Block is written every second
+as a keep-alive, so a closed pipe is noticed within a second. Either way
+the pipeline shuts down and the HackRF is closed properly.
+
+`btsdr extcap install` asks `tshark -G folders` for the personal extcap
+folder, falling back to the platform default. It copies the running
+executable there and checks that the copy answers `--extcap-interfaces`.
+
 ## 8. Validation
 
 - **Codec cross-checks** (`cargo test`):
@@ -322,7 +355,9 @@ little-endian.
   - LE advertising (CRC-valid packets from phones, printers and other nearby
     devices);
   - Classic inquiry trains from a PC (GIAC ID packets);
-  - live streaming into Wireshark.
+  - live streaming into Wireshark;
+  - the extcap interfaces through tshark: listing, option passing, LE and
+    BR/EDR link types in one stream, clean stop and error reporting.
 
 ## 9. Ideas for future work
 

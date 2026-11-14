@@ -121,6 +121,11 @@ pub trait PacketSink: Send {
     fn write_ble(&mut self, ts_ns: u64, p: &BlePacket) -> io::Result<()>;
     fn write_bredr(&mut self, ts_ns: u64, p: &BrPacket) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
+    /// Called about once per second; may write a harmless block so that a
+    /// closed pipe is detected even when no packets are captured.
+    fn keepalive(&mut self, _ts_ns: u64) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Classic libpcap file (nanosecond timestamps) with a single link type.
@@ -186,6 +191,8 @@ impl<W: Write + Send> PacketSink for PcapWriter<W> {
 pub struct PcapNgWriter<W: Write + Send> {
     w: W,
     flush_each: bool,
+    keepalive: bool,
+    interfaces: Vec<u16>,
 }
 
 fn pad4(n: usize) -> usize {
@@ -193,7 +200,21 @@ fn pad4(n: usize) -> usize {
 }
 
 impl<W: Write + Send> PcapNgWriter<W> {
-    pub fn new(mut w: W, flush_each: bool) -> io::Result<Self> {
+    /// PCAPNG with both interfaces (0 = LE, 1 = BR/EDR).
+    pub fn new(w: W, flush_each: bool) -> io::Result<Self> {
+        Self::with_interfaces(
+            w,
+            flush_each,
+            &[
+                LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR,
+                LINKTYPE_BLUETOOTH_BREDR_BB,
+            ],
+        )
+    }
+
+    /// PCAPNG with the given link types as interfaces 0, 1, ...; packets of
+    /// a link type that has no interface are skipped.
+    pub fn with_interfaces(mut w: W, flush_each: bool, linktypes: &[u16]) -> io::Result<Self> {
         // Section Header Block
         let app = format!("btsdr {}", env!("CARGO_PKG_VERSION"));
         let mut opts = Vec::new();
@@ -208,13 +229,36 @@ impl<W: Write + Send> PcapNgWriter<W> {
         w.write_all(&(-1i64).to_le_bytes())?;
         w.write_all(&opts)?;
         w.write_all(&len.to_le_bytes())?;
-        let mut s = Self { w, flush_each };
-        s.write_idb(LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR, "bluetooth-le")?;
-        s.write_idb(LINKTYPE_BLUETOOTH_BREDR_BB, "bluetooth-bredr")?;
+        let mut s = Self {
+            w,
+            flush_each,
+            keepalive: false,
+            interfaces: linktypes.to_vec(),
+        };
+        for &lt in linktypes {
+            let name = match lt {
+                LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR => "bluetooth-le",
+                LINKTYPE_BLUETOOTH_BREDR_BB => "bluetooth-bredr",
+                _ => "bluetooth",
+            };
+            s.write_idb(lt, name)?;
+        }
         if flush_each {
             s.w.flush()?;
         }
         Ok(s)
+    }
+
+    /// Write an (empty) Interface Statistics Block from [`PacketSink::keepalive`].
+    pub fn set_keepalive(&mut self, on: bool) {
+        self.keepalive = on;
+    }
+
+    fn iface(&self, linktype: u16) -> Option<u32> {
+        self.interfaces
+            .iter()
+            .position(|&l| l == linktype)
+            .map(|i| i as u32)
     }
 
     fn write_idb(&mut self, linktype: u16, name: &str) -> io::Result<()> {
@@ -261,12 +305,31 @@ fn push_option(buf: &mut Vec<u8>, code: u16, val: &[u8]) {
 
 impl<W: Write + Send> PacketSink for PcapNgWriter<W> {
     fn write_ble(&mut self, ts_ns: u64, p: &BlePacket) -> io::Result<()> {
-        self.write_epb(0, ts_ns, &le_record(p))
+        match self.iface(LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR) {
+            Some(i) => self.write_epb(i, ts_ns, &le_record(p)),
+            None => Ok(()),
+        }
     }
     fn write_bredr(&mut self, ts_ns: u64, p: &BrPacket) -> io::Result<()> {
-        self.write_epb(1, ts_ns, &bredr_record(p))
+        match self.iface(LINKTYPE_BLUETOOTH_BREDR_BB) {
+            Some(i) => self.write_epb(i, ts_ns, &bredr_record(p)),
+            None => Ok(()),
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+    fn keepalive(&mut self, ts_ns: u64) -> io::Result<()> {
+        if !self.keepalive {
+            return Ok(());
+        }
+        // Interface Statistics Block without options (24 bytes).
+        self.w.write_all(&5u32.to_le_bytes())?;
+        self.w.write_all(&24u32.to_le_bytes())?;
+        self.w.write_all(&0u32.to_le_bytes())?;
+        self.w.write_all(&((ts_ns >> 32) as u32).to_le_bytes())?;
+        self.w.write_all(&(ts_ns as u32).to_le_bytes())?;
+        self.w.write_all(&24u32.to_le_bytes())?;
         self.w.flush()
     }
 }
