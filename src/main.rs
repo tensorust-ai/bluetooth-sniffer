@@ -353,6 +353,15 @@ fn capture(a: CaptureArgs) -> anyhow::Result<()> {
             String::new()
         }
     );
+    let clip = stats.clipped as f64 / stats.source.samples.max(1) as f64;
+    if clip > 1e-4 {
+        eprintln!(
+            "WARNING: {:.3}% of samples were clipped by the ADC. A strong transmitter close to the \
+             antenna saturates the HackRF, which distorts the whole band (EDR/PSK suffers first). \
+             Lower --lna and/or --vga, or move the antenna away.",
+            100.0 * clip
+        );
+    }
     Ok(())
 }
 

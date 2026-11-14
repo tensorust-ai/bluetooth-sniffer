@@ -26,7 +26,9 @@ const INTERP: usize = 4;
 const INTERP_TAPS: usize = 12 * INTERP + 1;
 const RRC_SPAN: usize = 4;
 /// Minimum mean cos(phase error) over the sync sequence to accept it.
-const MIN_SYNC_QUALITY: f32 = 0.5;
+/// Real EDR packets score 0.99-1.0 at good SNR and ~0.9 at the decoding
+/// threshold; non-EDR or non-standard signals score around 0.5.
+const MIN_SYNC_QUALITY: f32 = 0.7;
 
 /// Map bits (air order, first bit of a symbol first) to DPSK phase changes in
 /// units of pi/4, using the Gray mappings of the core specification.

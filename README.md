@@ -346,8 +346,11 @@ Notes on the pseudo-headers:
 
 - **Too few packets:** raise `--vga` in steps of 4–6 dB, then `--lna`. Try
   `--amp` only for weak signals.
-- **Many bad CRCs on strong signals (above -10 dBFS):** the front end is
-  saturating. Lower the gain.
+- **"ADC CLIPPING" in the status line, or many bad CRCs on strong signals
+  (above -10 dBFS):** a transmitter close to the antenna saturates the
+  HackRF's 8-bit ADC. This distorts the whole band, including weak signals,
+  and EDR (8DPSK) suffers first. Lower the gain (e.g. `--lna 16 --vga 16`)
+  or move the antenna away.
 - **"samples DROPPED" in the summary:** the machine can't keep up. Reduce the
   sample rate (`-s 10`) or the channel list.
 - **Busy Wi-Fi channel inside your window:** consider another centre
@@ -414,9 +417,13 @@ contains overlapping transmissions.
   - Symbol timing is not tracked within an EDR packet. Very long 8DPSK
     packets from a transmitter with a large clock error may lose bits
     towards the end.
-  - The EDR demodulator is verified with synthetic signals; live EDR
-    validation is pending. Unencrypted EDR traffic for a test can be
-    generated with BlueZ, e.g. `l2ping -s 600 <bdaddr>`.
+  - Encrypted EDR traffic (most audio streams) cannot be CRC-checked. It is
+    reported with its header and the EDR rate only.
+  - In tests, one nearby device sent EDR-typed packets whose DPSK part did
+    not match the standard synchronisation sequence. btsdr reports such
+    packets with their header only.
+  - Unencrypted EDR traffic for a test can be generated with BlueZ, e.g.
+    `l2ping -s 600 <bdaddr>`.
 - **No frequency hopping:** btsdr monitors a fixed window of up to 20 MHz.
   Traffic outside it is not seen.
 - **No decryption:** encrypted payloads stay encrypted. On E0-encrypted
@@ -429,11 +436,18 @@ contains overlapping transmissions.
   Until then its packets are reported with the LAP only.
 - **Timestamps** are the host clock at start plus the sample count, so
   relative timing is precise to well under a microsecond.
-- **Validation:** decoding of live LE advertising and Classic inquiry traffic
-  has been verified with a HackRF One. LE connection following and BR
-  piconet/payload decoding are covered by end-to-end tests with synthetic
-  signals, and the codecs are cross-checked against reference tables.
-  Reports from other environments are welcome.
+- **Validation:** the following has been verified on live traffic with a
+  HackRF One:
+  - LE advertising, and LE connections both followed from `CONNECT_IND` and
+    discovered promiscuously;
+  - Classic inquiry;
+  - piconet UAP/clock discovery and BR payloads with valid CRC;
+  - EDR 2-DH1 (π/4-DQPSK) and 3-DH1 (8DPSK) packets with valid CRC and
+    readable L2CAP.
+
+  The end-to-end tests with synthetic signals and the codec cross-checks
+  against reference tables cover the rest. Reports from other environments
+  are welcome.
 
 ## How it works
 

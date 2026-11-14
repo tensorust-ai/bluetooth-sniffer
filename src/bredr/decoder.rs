@@ -438,13 +438,21 @@ fn type_plausible(ptype: u8, air_bits: usize, clk6: u8) -> bool {
     if ptype == 1 && clk6 & 1 == 1 {
         return false;
     }
+    // The measured length runs from the preamble to the end of the energy,
+    // so it includes the transmitter's power ramp-down: real radios add up
+    // to ~20 us to the nominal packet length.
+    // Minimum lengths: DM1 >= 171 us (126 + 45), DH1 >= 150, 2-DH1 >= 160,
+    // AUX1 >= 134. Keeping NULL/POLL and DM1 apart matters: the clock aliases
+    // created by the linear whitening turn POLL into DM1 and NULL into FHS.
     let n = air_bits as i64;
     match ptype {
-        0 | 1 => (n - 126).abs() <= 10,
-        2 => (n - 366).abs() <= 14,
-        3..=9 => (140..=380).contains(&n),
-        10..=13 => (140..=1636).contains(&n),
-        _ => (140..=2884).contains(&n),
+        0 | 1 => (116..=152).contains(&n), // nominal 126 us
+        2 => (352..=395).contains(&n),     // nominal 366 us
+        3 => (165..=400).contains(&n),
+        9 => (130..=400).contains(&n),
+        4..=8 => (145..=400).contains(&n),
+        10..=13 => (145..=1660).contains(&n),
+        _ => (145..=2910).contains(&n),
     }
 }
 

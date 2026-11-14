@@ -43,3 +43,14 @@ First release.
   - GFSK CFO/timing estimation is limited to the start of the burst.
   - `synth` generates EDR packets; `examples/benchmark.rs --edr` measures
     them.
+- Live validation with a phone and earbuds:
+  - EDR 2-DH1/3-DH1 decoded with valid CRC;
+  - LE connections followed and discovered;
+  - piconets locked.
+- ADC clipping detection: the status line and summary warn and suggest
+  lowering the gain.
+- BR length plausibility accounts for the transmitter's power ramp-down.
+  Idle piconets (only POLL/NULL) of some devices were rejected before;
+  locked piconets now de-whiten 95%+ of their headers live.
+- The EDR sync threshold was raised to 0.7, so non-standard DPSK packets are
+  no longer reported as EDR.

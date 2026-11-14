@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Oversampling of the channelizer outputs (2 samples per 1 Msym/s symbol).
@@ -85,6 +85,8 @@ pub struct CaptureStats {
     pub bursts: u64,
     /// Bursts discarded as wideband interference (e.g. Wi-Fi).
     pub wideband: u64,
+    /// Complex samples with a clipped I or Q component (ADC saturation).
+    pub clipped: u64,
     pub ble_packets: u64,
     pub br_packets: u64,
     pub elapsed: f64,
@@ -94,6 +96,16 @@ struct DspResult {
     samples: u64,
     bursts: u64,
     wideband: u64,
+}
+
+/// Number of complex 8-bit samples whose I or Q is at full scale.
+pub fn count_clipped_ci8(raw: &[u8]) -> u64 {
+    raw.chunks_exact(2)
+        .filter(|c| {
+            let (i, q) = (c[0] as i8, c[1] as i8);
+            i == i8::MAX || i <= -127 || q == i8::MAX || q <= -127
+        })
+        .count() as u64
 }
 
 /// Wi-Fi and other wideband signals switch on in many 1 MHz channels at the
@@ -162,6 +174,9 @@ pub fn run(
     let channels = cfg.channels_mhz.clone();
     let squelch = cfg.squelch_db;
     let dsp_stop = stop.clone();
+    let clipped = Arc::new(AtomicU64::new(0));
+    let dsp_clipped = clipped.clone();
+    let mut last_clipped = (0u64, 0u64); // (clipped, samples) at the last status line
     let chz = Channelizer::new(m, OVERSAMPLE, TAPS_PER_BRANCH, bins);
     let extra_delay = -chz.delay_samples() / fs_in;
     let dsp_thread = std::thread::Builder::new().name("dsp".into()).spawn(
@@ -183,6 +198,7 @@ pub fn run(
                         if let Some(r) = record.as_mut() {
                             r.write_all(v)?;
                         }
+                        dsp_clipped.fetch_add(count_clipped_ci8(v), Ordering::Relaxed);
                         chz.push_ci8(v);
                     }
                     IqBlock::Cf32(v) => {
@@ -354,8 +370,21 @@ pub fn run(
             if last_status.elapsed().as_secs_f64() >= iv {
                 last_status = Instant::now();
                 reporter.flush();
+                // ADC clipping since the previous status line
+                let c = clipped.load(Ordering::Relaxed);
+                let n = (last_t.max(0.0) * fs_in) as u64;
+                let (dc, dn) = (c - last_clipped.0, n.saturating_sub(last_clipped.1));
+                last_clipped = (c, n);
+                let clip = if dc > 0 && dn > 0 {
+                    format!(
+                        " | ADC CLIPPING {:.3}% - lower --lna/--vga",
+                        100.0 * dc as f64 / dn as f64
+                    )
+                } else {
+                    String::new()
+                };
                 reporter.status(&format!(
-                    "[{:>8.1} s] bursts {} | BLE {} | BR {} | queue {}",
+                    "[{:>8.1} s] bursts {} | BLE {} | BR {} | queue {}{clip}",
                     last_t,
                     stats.bursts,
                     stats.ble_packets,
@@ -395,6 +424,7 @@ pub fn run(
     stats.source.samples = stats.source.samples.max(dsp.samples);
     stats.bursts = dsp.bursts;
     stats.wideband = dsp.wideband;
+    stats.clipped = clipped.load(Ordering::Relaxed);
     stats.elapsed = started.elapsed().as_secs_f64();
     reporter.summary(ble.as_ref(), br.as_ref());
     if let Some(e) = sink_error {

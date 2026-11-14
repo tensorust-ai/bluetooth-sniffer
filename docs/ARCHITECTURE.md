@@ -44,6 +44,10 @@ The callback context outlives `hackrf_close()`, which joins the USB thread.
 
 `file.rs` reads `ci8` (HackRF native), `cu8`, `ci16` and `cf32` recordings.
 
+The DSP thread also counts samples whose I or Q is at full scale. ADC
+clipping from a strong transmitter near the antenna distorts the whole band
+(PSK first), so the status line and the summary warn about it.
+
 ## 2. Channelizer (`dsp/channelizer.rs`)
 
 The input of `M = fs / 1 MHz` complex samples per microsecond is split into
@@ -239,7 +243,21 @@ The UAP and CLK6-1 are not transmitted in clear, but they can be recovered:
   "clock offset `c₀`" implies `c = (c₀ + s_i) mod 64`.
 - **Voting.** Every packet votes for the 64 pairs `(u(c), c − s_i)` in a
   256 × 64 table. Only types whose length agrees with the observed air time
-  vote: NULL/POLL ≈ 126 µs, FHS ≈ 366 µs, single-slot ≤ 366 µs, and so on.
+  vote. The measured length runs from the preamble to the end of the energy,
+  so it includes the transmitter's power ramp-down: live devices add up to
+  ~20 µs. Accepted ranges:
+
+  | Types | Range |
+  |-------|-------|
+  | NULL/POLL | 116–152 µs |
+  | FHS | 352–395 µs |
+  | DM1 | 165–400 µs |
+  | other single-slot | 145–400 µs |
+  | 3-slot | up to 1660 µs |
+  | 5-slot | up to 2910 µs |
+
+  The minima keep NULL/POLL apart from DM1/FHS, which the clock aliases
+  below would otherwise turn them into.
   A pair whose payload decodes with a valid CRC-16 gets weight 5 instead
   of 1.
 - **Protocol rule.** POLL is only sent by the master, and the master only
@@ -314,8 +332,9 @@ The demodulator works on the burst's channel samples:
 2. **Matched filter:** apply the RRC matched filter.
 3. **Timing:** try reference-symbol positions for guard times of 4.5–5.5 µs
    in 1/8-symbol steps. Keep the one whose ten differential phases best
-   match the sync sequence (mean cos of the error; at least 0.5 is
-   required).
+   match the sync sequence (mean cos of the error; at least 0.7 is
+   required). Real EDR packets score 0.99–1.0, and about 0.9 at the
+   decoding threshold. Signals that are not standard EDR score around 0.5.
 4. **Residual frequency error:** estimate it from the sync sequence.
 5. **Detection:** detect each payload symbol differentially (nearest
    constellation phase change) and track the residual error decision-
@@ -424,6 +443,12 @@ executable there and checks that the copy answers `--extcap-interfaces`.
   - LE advertising (CRC-valid packets from phones, printers and other nearby
     devices);
   - Classic inquiry trains from a PC (GIAC ID packets);
+  - LE connections followed from `CONNECT_IND` and discovered
+    promiscuously, with CRC-valid data packets;
+  - Classic piconets: UAP/clock discovery, header de-whitening (95%+ of the
+    packets of locked piconets), BR payloads with valid CRC;
+  - EDR 2-DH1 and 3-DH1 packets from a phone with valid CRC and consistent
+    L2CAP lengths;
   - live streaming into Wireshark;
   - the extcap interfaces through tshark: listing, option passing, LE and
     BR/EDR link types in one stream, clean stop and error reporting.
