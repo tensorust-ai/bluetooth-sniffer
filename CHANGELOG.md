@@ -36,3 +36,10 @@ First release.
 
   `--hard-decisions` restores the previous behaviour for comparison.
 - `btsdr synth --impaired` adds realistic radio impairments.
+- EDR payload demodulation (π/4-DQPSK and 8DPSK) for 2-DH1 … 3-DH5, with
+  CRC check and Wireshark transport/rate flags.
+  - The channelizer is widened to ±0.7 MHz for EDR; GFSK keeps a ±0.6 MHz
+    filter in its demodulator.
+  - GFSK CFO/timing estimation is limited to the start of the burst.
+  - `synth` generates EDR packets; `examples/benchmark.rs --edr` measures
+    them.

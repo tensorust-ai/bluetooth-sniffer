@@ -10,6 +10,8 @@ use super::filter;
 use num_complex::Complex32;
 
 pub const INTERP: usize = 4;
+/// Length of the burst start used for CFO, timing and threshold estimation.
+const EST_WINDOW_US: usize = 128;
 const INTERP_TAPS: usize = 12 * INTERP + 1;
 
 #[derive(Clone, Debug)]
@@ -26,6 +28,9 @@ pub struct Demodulated {
     pub cfo_hz: f32,
     /// Estimated peak frequency deviation (Hz).
     pub deviation_hz: f32,
+    /// Fractional index into the burst's channel samples of the centre of
+    /// bit 0 (signal time, filter delays removed).
+    pub sample_of_bit0: f64,
 }
 
 impl Demodulated {
@@ -38,6 +43,8 @@ impl Demodulated {
 pub struct GfskDemod {
     /// Polyphase interpolation filter: phases[r][k]
     phases: Vec<Vec<f32>>,
+    /// Optional zero-phase channel filter applied before interpolation.
+    pre: Option<Vec<f32>>,
     /// Extra capture-time delay to subtract (wideband filter delay), seconds.
     extra_delay: f64,
 }
@@ -55,8 +62,22 @@ impl GfskDemod {
         }
         Self {
             phases,
+            pre: None,
             extra_delay,
         }
+    }
+
+    /// Demodulator with an additional zero-phase low-pass filter (one-sided
+    /// -6 dB cutoff `cutoff_hz`) on the `channel_rate` samples, for use when
+    /// the channelizer is kept wider for EDR.
+    pub fn with_prefilter(extra_delay: f64, cutoff_hz: f64, channel_rate: f64) -> Self {
+        let mut d = Self::new(extra_delay);
+        d.pre = Some(filter::lowpass(
+            25,
+            cutoff_hz / channel_rate,
+            filter::kaiser_beta(50.0),
+        ));
+        d
     }
 
     pub fn demodulate(&self, b: &Burst) -> Option<Demodulated> {
@@ -65,6 +86,28 @@ impl GfskDemod {
             return None;
         }
         let fs_hi = b.sample_rate * INTERP as f64;
+        // 0. optional narrower channel filter, zero-phase so that timing and
+        // burst edges stay aligned
+        let filtered: Vec<Complex32>;
+        let x: &[Complex32] = match &self.pre {
+            Some(h) => {
+                let half = h.len() / 2;
+                filtered = (0..n_in)
+                    .map(|n| {
+                        let mut acc = Complex32::new(0.0, 0.0);
+                        for (k, &t) in h.iter().enumerate() {
+                            let idx = n as isize + half as isize - k as isize;
+                            if idx >= 0 && (idx as usize) < n_in {
+                                acc += b.samples[idx as usize] * t;
+                            }
+                        }
+                        acc
+                    })
+                    .collect();
+                &filtered
+            }
+            None => &b.samples,
+        };
         // 1. interpolate: y[4n + r] = sum_k phases[r][k] x[n - k]
         let n_out = n_in * INTERP;
         let mut z = Vec::with_capacity(n_out);
@@ -73,7 +116,7 @@ impl GfskDemod {
                 let mut acc = Complex32::new(0.0, 0.0);
                 for (k, &t) in ph.iter().enumerate() {
                     if n >= k {
-                        acc += b.samples[n - k] * t;
+                        acc += x[n - k] * t;
                     }
                 }
                 z.push(acc);
@@ -110,7 +153,12 @@ impl GfskDemod {
         if ce <= cs + 8 * sps {
             return None;
         }
-        // 4. CFO estimate: mean over the core (whitened data is balanced)
+        // Estimate CFO, timing and threshold on the start of the burst only:
+        // it covers the LE preamble/access address/header and the BR access
+        // code and header, which are GFSK even when an EDR (DPSK) payload
+        // follows.
+        let ce = ce.min(cs + EST_WINDOW_US * sps);
+        // 4. CFO estimate: mean over the window (whitened data is balanced)
         let mut cfo = g[cs..ce].iter().sum::<f32>() / (ce - cs) as f32;
         // 5. timing: phase with the largest mean |g - cfo|
         let mut best = (0usize, -1f32);
@@ -176,6 +224,7 @@ impl GfskDemod {
             core_end_bit,
             cfo_hz: cfo,
             deviation_hz: dev,
+            sample_of_bit0: (phase as f64 - delay) / INTERP as f64,
         })
     }
 }

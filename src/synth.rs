@@ -130,6 +130,49 @@ pub fn br_packet_bits(
     v
 }
 
+/// Bits per DPSK symbol for an EDR ACL packet type (2-DHx: 2, 3-DHx: 3).
+pub fn edr_bits_per_symbol(ptype: u8) -> Option<usize> {
+    match ptype {
+        4 | 10 | 14 => Some(2),
+        8 | 11 | 15 => Some(3),
+        _ => None,
+    }
+}
+
+/// EDR ACL packet (2-DH1 ... 3-DH5): returns the GFSK bits (access code and
+/// coded header) and the DPSK phase changes (sync sequence, payload with its
+/// 2-byte payload header and CRC, trailer) in units of pi/4.
+#[allow(clippy::too_many_arguments)]
+pub fn br_edr_packet(
+    lap: u32,
+    uap: u8,
+    clk6: u8,
+    ptype: u8,
+    lt_addr: u8,
+    seqn: bool,
+    llid: u8,
+    body: &[u8],
+) -> (Vec<u8>, Vec<i8>) {
+    let bps = edr_bits_per_symbol(ptype).expect("not an EDR ACL type");
+    let mut gfsk = bredr::access_code_bits(lap, true);
+    let hdr = bredr::build_header(lt_addr, ptype, true, false, seqn, uap);
+    let mut hb = bits::from_u64(hdr as u64, 18);
+    bredr::whiten(&mut hb, clk6, 0);
+    gfsk.extend(bredr::fec13_encode(&hb));
+    let h = (llid as u16 & 3) | (1 << 2) | ((body.len() as u16 & 0x3FF) << 3);
+    let mut payload = h.to_le_bytes().to_vec();
+    payload.extend_from_slice(body);
+    let crc = bredr::crc16(uap, &payload);
+    payload.extend_from_slice(&crc);
+    let mut pb = bits::unpack_lsb(&payload);
+    bredr::whiten(&mut pb, clk6, 18);
+    let mut steps = crate::dsp::edr::SYNC_STEPS.to_vec();
+    steps.extend(crate::dsp::edr::bits_to_steps(&pb, bps));
+    // trailer: two symbols of zero bits
+    steps.extend(crate::dsp::edr::bits_to_steps(&vec![0u8; 2 * bps], bps));
+    (gfsk, steps)
+}
+
 /// ID packet (access code only).
 pub fn br_id_bits(lap: u32) -> Vec<u8> {
     bredr::access_code_bits(lap, false)
@@ -223,6 +266,56 @@ impl Gfsk {
     pub fn ramp_samples(&self) -> usize {
         2 * self.sps
     }
+
+    /// EDR packet waveform: `gfsk_bits` (access code + coded header) in GFSK,
+    /// a 5 us guard of unmodulated carrier, then the DPSK symbols - a
+    /// reference symbol followed by `steps` (phase changes in units of pi/4,
+    /// including sync sequence and trailer) - with root-raised-cosine pulses.
+    pub fn modulate_edr(&self, gfsk_bits: &[u8], dev_hz: f64, steps: &[i8]) -> Vec<Complex32> {
+        let sps = self.sps;
+        let ramp = 2 * sps;
+        let span = 4;
+        let g = self.modulate(gfsk_bits, dev_hz);
+        let n_g = ramp + gfsk_bits.len() * sps;
+        let mut out: Vec<Complex32> = g[..n_g].to_vec();
+        let last = out[n_g - 1];
+        let phi = last.im.atan2(last.re) as f64;
+        let guard = 5 * sps;
+        let n_sym = 1 + steps.len();
+        out.resize(
+            n_g + guard + (n_sym + span) * sps + ramp,
+            Complex32::new(0.0, 0.0),
+        );
+        // guard: carrier, faded out while the first DPSK pulses fade in
+        for k in 0..guard {
+            let w = if k + 2 * sps >= guard {
+                (guard - k) as f32 / (2 * sps) as f32
+            } else {
+                1.0
+            };
+            out[n_g + k] += Complex32::from_polar(w, phi as f32);
+        }
+        let rrc = crate::dsp::filter::root_raised_cosine(sps, crate::dsp::edr::ROLL_OFF, span);
+        let mut theta = phi;
+        for s in 0..n_sym {
+            if s > 0 {
+                theta += steps[s - 1] as f64 * PI / 4.0;
+            }
+            let a = Complex32::from_polar(1.0, theta as f32);
+            let center = (n_g + guard + s * sps + sps / 2) as i64;
+            for (k, &h) in rrc.iter().enumerate() {
+                let idx = center + k as i64 - (span * sps) as i64;
+                if idx >= 0 && (idx as usize) < out.len() {
+                    out[idx as usize] += a * h;
+                }
+            }
+        }
+        let n = out.len();
+        for k in 0..ramp {
+            out[n - 1 - k] *= k as f32 / ramp as f32;
+        }
+        out
+    }
 }
 
 /// Radio impairments applied to every synthesised packet.
@@ -295,11 +388,35 @@ impl Scene {
 
     /// Add a packet whose first bit starts at time `t` (s) on `freq_mhz`.
     pub fn add(&mut self, t: f64, freq_mhz: u32, bits: &[u8], dev_hz: f64, amp: f32, cfo_hz: f64) {
-        let sym = |r: &mut XorShift| 2.0 * r.uniform() - 1.0;
-        let dev = dev_hz * (1.0 + sym(&mut self.rng) * self.imp.h_spread);
-        let drift = sym(&mut self.rng) * self.imp.drift_hz_per_us * 1e6; // Hz/s
-        let pn_step = self.imp.phase_noise * (1e6 / self.fs).sqrt();
+        let dev = self.impaired_deviation(dev_hz);
         let wave = self.gfsk.modulate(bits, dev);
+        self.mix(&wave, t, freq_mhz, amp, cfo_hz);
+    }
+
+    /// Add an EDR packet (see [`br_edr_packet`]) whose first bit starts at `t`.
+    pub fn add_edr(
+        &mut self,
+        t: f64,
+        freq_mhz: u32,
+        gfsk_bits: &[u8],
+        steps: &[i8],
+        amp: f32,
+        cfo_hz: f64,
+    ) {
+        let dev = self.impaired_deviation(BR_DEV);
+        let wave = self.gfsk.modulate_edr(gfsk_bits, dev, steps);
+        self.mix(&wave, t, freq_mhz, amp, cfo_hz);
+    }
+
+    fn impaired_deviation(&mut self, dev_hz: f64) -> f64 {
+        dev_hz * (1.0 + (2.0 * self.rng.uniform() - 1.0) * self.imp.h_spread)
+    }
+
+    /// Mix a baseband waveform (first bit after the ramp at time `t`) onto
+    /// the wideband buffer, applying carrier offset, drift and phase noise.
+    fn mix(&mut self, wave: &[Complex32], t: f64, freq_mhz: u32, amp: f32, cfo_hz: f64) {
+        let drift = (2.0 * self.rng.uniform() - 1.0) * self.imp.drift_hz_per_us * 1e6; // Hz/s
+        let pn_step = self.imp.phase_noise * (1e6 / self.fs).sqrt();
         let start = (t * self.fs).round() as i64 - self.gfsk.ramp_samples() as i64;
         let f_off = (freq_mhz as f64 - self.center_mhz as f64) * 1e6 + cfo_hz;
         let mut pn = 0.0f64;
@@ -374,6 +491,8 @@ pub struct ScenarioInfo {
     pub br_uap: u8,
     pub br_packets: usize,
     pub br_crc_packets: usize,
+    /// EDR ACL packets (2-DH1, 3-DH1, 2-DH3) sent by the piconet master.
+    pub br_edr_packets: usize,
     pub inquiry_ids: usize,
     pub fhs_bd_addr: String,
 }
@@ -417,6 +536,7 @@ pub fn demo_scenario(
         br_uap: 0x5D,
         br_packets: 0,
         br_crc_packets: 0,
+        br_edr_packets: 0,
         inquiry_ids: 0,
         fhs_bd_addr: "00:1a:7d:da:71:13".into(),
     };
@@ -520,7 +640,8 @@ pub fn demo_scenario(
     {
         let slot = 625e-6;
         let clk0: u32 = 0x1234; // master clock (CLK) at t = 0, 312.5 us ticks
-        let mut slot_idx = 3i64; // even slots: master
+        // start chosen so that the long 2-DH3 packets fall between LE events
+        let mut slot_idx = 5i64;
         // the master transmits in slots with CLK1 = 0
         if (clk0.wrapping_add((slot_idx * 2) as u32) >> 1) & 1 == 1 {
             slot_idx += 1;
@@ -536,20 +657,35 @@ pub fn demo_scenario(
             let clk6 = ((clk >> 1) & 0x3F) as u8;
             let f = br_freqs[(rng.next_u64() % br_freqs.len() as u64) as usize];
             let (ptype, body): (u8, Vec<u8>) = match n % 6 {
-                // DM1: L2CAP signalling Echo Request
-                1 => (3, vec![0x04, 0x00, 0x01, 0x00, 0x08, 0x01, 0x00, 0x00]),
+                // DM1: 4 bytes of L2CAP data on dynamic channel 0x0040
+                1 => (3, vec![0x04, 0x00, 0x40, 0x00, 0xDE, 0xAD, 0xBE, 0xEF]),
+                // 2-DH1 (EDR, pi/4-DQPSK)
+                2 => (4, (0..40u8).map(|i| i.wrapping_mul(7)).collect()),
+                // 3-DH1 (EDR, 8DPSK)
+                3 => (8, (0..60u8).map(|i| i.wrapping_mul(13)).collect()),
                 // DH1: start of a longer L2CAP frame
                 4 => (4, (0..20u8).collect()),
+                // 2-DH3 (EDR, three slots)
+                5 => (10, (0..200u8).map(|i| i ^ 0x5A).collect()),
                 _ => (1, Vec::new()), // POLL
             };
-            let bits = br_packet_bits(info.br_lap, info.br_uap, clk6, ptype, 1, seq, 2, &body);
-            sc.add(t, f, &bits, BR_DEV, amp, cfo(&mut rng));
-            info.br_packets += 1;
-            if ptype != 1 {
-                info.br_crc_packets += 1;
+            let edr = n % 6 == 2 || n % 6 == 3 || n % 6 == 5;
+            let slots = if ptype == 10 { 3 } else { 1 };
+            if edr {
+                let (g, steps) =
+                    br_edr_packet(info.br_lap, info.br_uap, clk6, ptype, 1, seq, 2, &body);
+                sc.add_edr(t, f, &g, &steps, amp, cfo(&mut rng));
+                info.br_edr_packets += 1;
+            } else {
+                let bits = br_packet_bits(info.br_lap, info.br_uap, clk6, ptype, 1, seq, 2, &body);
+                sc.add(t, f, &bits, BR_DEV, amp, cfo(&mut rng));
+                if ptype != 1 {
+                    info.br_crc_packets += 1;
+                }
             }
-            // slave answers with NULL in the next slot
-            let clk_s = clk.wrapping_add(2);
+            info.br_packets += 1;
+            // slave answers with NULL in the slot after the master's packet
+            let clk_s = clk.wrapping_add(2 * slots as u32);
             let f2 = br_freqs[(rng.next_u64() % br_freqs.len() as u64) as usize];
             let bits = br_packet_bits(
                 info.br_lap,
@@ -561,7 +697,14 @@ pub fn demo_scenario(
                 0,
                 &[],
             );
-            sc.add(t + slot, f2, &bits, BR_DEV, amp, cfo(&mut rng));
+            sc.add(
+                t + slot * slots as f64,
+                f2,
+                &bits,
+                BR_DEV,
+                amp,
+                cfo(&mut rng),
+            );
             info.br_packets += 1;
             seq = !seq;
             n += 1;
@@ -587,6 +730,70 @@ pub fn demo_scenario(
     }
 
     (sc.to_ci8(noise_rms, seed), info)
+}
+
+/// EDR-only scenario for measuring the DPSK demodulator: one piconet whose
+/// master cycles through 2-DH1, 3-DH1, 2-DH3, 3-DH3, 2-DH5 and 3-DH5 with
+/// maximum-size payloads (slave answers with NULL), on random channels and
+/// without any other traffic. Returns the IQ data, the LAP and the number of
+/// packets sent per type (indexed like [`EDR_SCENARIO_TYPES`]).
+pub const EDR_SCENARIO_TYPES: [u8; 6] = [4, 8, 10, 11, 14, 15];
+
+pub fn edr_scenario(
+    center_mhz: u32,
+    rate_mhz: u32,
+    duration: f64,
+    snr_db: f64,
+    seed: u64,
+    imp: Impairments,
+) -> (Vec<u8>, u32, [usize; 6]) {
+    let fs = rate_mhz as f64 * 1e6;
+    let mut sc = Scene::with_impairments(fs, center_mhz, duration, imp, seed);
+    let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).max(1));
+    let half = rate_mhz as i64 / 2 - 2;
+    let lo = (center_mhz as i64 - half).max(2402) as u32;
+    let hi = (center_mhz as i64 + half).min(2480) as u32;
+    let freqs: Vec<u32> = (lo..=hi).collect();
+    let amp = 0.25f32;
+    let noise_rms = amp / 10f32.powf(snr_db as f32 / 20.0) * (fs as f32 / 1e6).sqrt();
+    let (lap, uap) = (0x3C5A96u32, 0xB1u8);
+    let max_len = [54usize, 83, 367, 552, 679, 1021];
+    let slots = [1u32, 1, 3, 3, 5, 5];
+    let mut sent = [0usize; 6];
+    let slot = 625e-6;
+    let clk0: u32 = 0x2000;
+    let mut slot_idx = 4i64;
+    let mut n = 0usize;
+    loop {
+        let t = slot_idx as f64 * slot + 0.0001;
+        if t > duration - 0.0045 {
+            break;
+        }
+        let clk = clk0.wrapping_add((slot_idx * 2) as u32);
+        let k = n % 6;
+        let body: Vec<u8> = (0..max_len[k]).map(|_| rng.next_u64() as u8).collect();
+        let (g, steps) = br_edr_packet(
+            lap,
+            uap,
+            ((clk >> 1) & 0x3F) as u8,
+            EDR_SCENARIO_TYPES[k],
+            1,
+            n % 2 == 0,
+            2,
+            &body,
+        );
+        let f = freqs[(rng.next_u64() % freqs.len() as u64) as usize];
+        let cfo = (2.0 * rng.uniform() - 1.0) * imp.cfo_hz;
+        sc.add_edr(t, f, &g, &steps, amp, cfo);
+        sent[k] += 1;
+        let clk_s = clk.wrapping_add(2 * slots[k]);
+        let null = br_packet_bits(lap, uap, ((clk_s >> 1) & 0x3F) as u8, 0, 1, false, 0, &[]);
+        let f2 = freqs[(rng.next_u64() % freqs.len() as u64) as usize];
+        sc.add(t + slot * slots[k] as f64, f2, &null, BR_DEV, amp, cfo);
+        n += 1;
+        slot_idx += 6;
+    }
+    (sc.to_ci8(noise_rms, seed), lap, sent)
 }
 
 #[cfg(test)]

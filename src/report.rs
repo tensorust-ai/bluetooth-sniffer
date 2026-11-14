@@ -211,8 +211,13 @@ impl Reporter {
         }
         if let Some(b) = br {
             s += &format!(
-                "BR:  {} ID packets, {} packets with header, {} headers de-whitened, {} payload CRC ok\n",
-                b.stats.id_packets, b.stats.header_packets, b.stats.decoded_headers, b.stats.crc_ok
+                "BR:  {} ID packets, {} packets with header, {} headers de-whitened, {} payload CRC ok; EDR: {} detected, {} CRC ok\n",
+                b.stats.id_packets,
+                b.stats.header_packets,
+                b.stats.decoded_headers,
+                b.stats.crc_ok,
+                b.stats.edr_detected,
+                b.stats.edr_crc_ok
             );
             let mut pns: Vec<_> = b.piconets().collect();
             pns.sort_by_key(|p| std::cmp::Reverse(p.packets));

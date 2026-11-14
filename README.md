@@ -41,7 +41,7 @@ HackRF One ──► channelizer (PFB) ──► burst detector ──► GFSK d
 - Device names, company IDs and service UUIDs are extracted from
   advertising data.
 
-**Bluetooth Classic (BR, basic rate)**
+**Bluetooth Classic (BR/EDR)**
 - The LAP is read directly from the access code: a BCH(64,30) sync word with
   error correction.
 - Inquiry (GIAC/DIAC) and page ID packets.
@@ -52,6 +52,8 @@ HackRF One ──► channelizer (PFB) ──► burst detector ──► GFSK d
   for the rate-2/3 payload code.
 - An FHS packet (inquiry or page response) reveals the full BD_ADDR, class of
   device and clock.
+- EDR payload demodulation: π/4-DQPSK (2 Mbit/s) and 8DPSK (3 Mbit/s) for the
+  ACL packets 2-DH1, 3-DH1, 2-DH3, 3-DH3, 2-DH5 and 3-DH5, with CRC check.
 
 **Output**
 - PCAPNG with both link types in one file, or separate PCAP files:
@@ -288,7 +290,8 @@ Writes a synthetic `ci8` recording containing:
 - LE advertising;
 - a `CONNECT_IND` and the connection it announces;
 - a second, pre-existing connection;
-- a Classic piconet with POLL, NULL, DM1 and DH1 packets;
+- a Classic piconet with POLL, NULL, DM1, DH1 and EDR (2-DH1, 3-DH1,
+  2-DH3) packets;
 - inquiry ID packets and an FHS response.
 
 Options: `-o <file>`, `-f <MHz>`, `-s <Msps>`, `-t <seconds>`, `--snr <dB>`,
@@ -330,6 +333,11 @@ Notes on the pseudo-headers:
 - **BR packets** carry the LAP, the UAP (once known), the de-whitened header
   (once the clock is known) and, when the CRC passes, the de-whitened and
   FEC-decoded payload. Wireshark then dissects LMP and L2CAP.
+- **EDR packets** with a valid CRC are marked "Enhanced Data Rate, ACL" with
+  the 2 or 3 Mbit/s modulation. Wireshark names them 2-DH1 … 3-DH5 and
+  dissects their payload. When the EDR modulation is found but the CRC does
+  not match (usually an encrypted link), only the header is written, with
+  the EDR rate set.
 - **BR packets captured before their piconet's UAP was discovered** are kept
   back for a few seconds and written decoded afterwards. Their timestamps
   stay correct, but they can appear slightly out of order in the file.
@@ -364,17 +372,31 @@ SNR at which 50% of the packets are decoded (lower is better):
 
 | Packets | v0.1.0 (hard decisions) | current |
 |---------|------------------------:|--------:|
-| LE advertising | 11.4 dB | 8.9 dB |
-| LE data (empty PDUs and short payloads) | 9.6 dB | 8.3 dB |
-| BR header de-whitened (piconet locked) | 13.4 dB | 10.2 dB |
-| BR payload with valid CRC | 14.0 dB | 12.6 dB |
-| BR inquiry ID | 10.9 dB | 9.7 dB |
+| LE advertising | 11.4 dB | 9.2 dB |
+| LE data (empty PDUs and short payloads) | 9.6 dB | 8.6 dB |
+| BR header de-whitened (piconet locked) | 13.4 dB | 10.0 dB |
+| BR payload with valid CRC | 14.0 dB | 12.8 dB |
+| BR inquiry ID | 10.9 dB | 9.9 dB |
 
 The gains come from three changes:
-- **A narrower channel filter** (±0.6 MHz instead of ±0.8 MHz).
+- **A narrower channel filter for GFSK** (±0.6 MHz instead of ±0.8 MHz).
 - **Soft decisions.** CRC repair for LE; soft majority and Chase decoding of
   the FEC for BR.
 - **A more robust piconet lock** for BR.
+
+The channelizer itself is ±0.7 MHz wide, so that EDR signals pass. This
+costs GFSK about 0.3 dB compared with a ±0.6 MHz channelizer.
+
+EDR payloads, measured with `--edr` on a scenario with only EDR traffic and
+maximum-length payloads:
+
+| Packet | Modulation | 50% decoded at |
+|--------|------------|---------------:|
+| 2-DH1 / 2-DH3 / 2-DH5 | π/4-DQPSK | 13.0 / 14.1 / 14.6 dB |
+| 3-DH1 / 3-DH3 / 3-DH5 | 8DPSK | 18.9 / 20.8 / 21.1 dB |
+
+This is within about 1.5–2 dB of ideal differential detection. 8DPSK needs a
+strong signal, as in any receiver.
 
 On two indoor recordings, the same changes increased the number of
 CRC-valid LE advertising packets by 13%, and cut the remaining bad-CRC
@@ -386,13 +408,20 @@ contains overlapping transmissions.
 ## Limitations
 
 - **LE:** only the LE 1M PHY. LE 2M and LE Coded are not demodulated.
-- **Classic: basic rate only.** EDR payloads (π/4-DQPSK, 8DPSK) are not
-  demodulated. For EDR packets you still get the access code and the header,
-  because the header is always GFSK. SCO/eSCO voice payloads are not
-  decoded.
+- **Classic EDR:**
+  - ACL payloads (2-DHx, 3-DHx) are demodulated, but eSCO EDR (2-EVx, 3-EVx)
+    and SCO/eSCO voice payloads are not; their headers are.
+  - Symbol timing is not tracked within an EDR packet. Very long 8DPSK
+    packets from a transmitter with a large clock error may lose bits
+    towards the end.
+  - The EDR demodulator is verified with synthetic signals; live EDR
+    validation is pending. Unencrypted EDR traffic for a test can be
+    generated with BlueZ, e.g. `l2ping -s 600 <bdaddr>`.
 - **No frequency hopping:** btsdr monitors a fixed window of up to 20 MHz.
   Traffic outside it is not seen.
-- **No decryption:** encrypted payloads stay encrypted. A valid BR CRC
+- **No decryption:** encrypted payloads stay encrypted. On E0-encrypted
+  links the CRC cannot be checked either, so such BR/EDR packets are written
+  with their header only. A valid BR CRC
   normally means the payload is readable, so such packets are marked
   "decrypted" so that Wireshark dissects them.
 - **UAP discovery needs data:** a piconet's UAP and clock are found after a

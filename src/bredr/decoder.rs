@@ -21,7 +21,10 @@ use super::*;
 use crate::bits;
 use crate::ble::decoder::{BurstInfo, clamp_i8};
 use crate::ble::parse_ad;
+use crate::dsp::burst::Burst;
 use crate::dsp::demod::Demodulated;
+use crate::dsp::edr::{DpskBits, EdrContext, EdrDemod};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 pub const SLOT: f64 = 625e-6;
@@ -85,6 +88,10 @@ pub struct BrPacket {
     pub noise_dbm: i8,
     /// Observed packet duration in bits (from the preamble to the end of energy).
     pub air_bits: usize,
+    /// Payload modulation: 0 = basic rate, 1 = EDR 2 Mbit/s, 2 = EDR 3 Mbit/s.
+    pub rate: u8,
+    /// EDR sync-sequence quality (1.0 = perfect) when an EDR payload was found.
+    pub edr_quality: Option<f32>,
 }
 
 /// Fields of an FHS payload.
@@ -165,7 +172,13 @@ impl BrPacket {
             return s;
         };
         let ti = type_info(pt);
-        let name = if self.crc_valid == Some(true) || self.payload.is_none() && pt <= 1 {
+        let name = if self.rate > 0 {
+            format!(
+                "{} (EDR {}M)",
+                edr_type_name(pt).unwrap_or(ti.name),
+                self.rate + 1
+            )
+        } else if self.crc_valid == Some(true) || self.payload.is_none() && pt <= 1 {
             ti.name.to_string()
         } else {
             // without a payload CRC we cannot tell BR from EDR
@@ -214,9 +227,10 @@ impl BrPacket {
                 if f.eir { " EIR" } else { "" }
             );
         } else if let (Some(p), Some(true)) = (&self.payload, self.crc_valid) {
-            if ti.header_bytes > 0 && p.len() >= ti.header_bytes + 2 {
+            let header_bytes = if self.rate > 0 { 2 } else { ti.header_bytes };
+            if header_bytes > 0 && p.len() >= header_bytes + 2 {
                 let llid = p[0] & 3;
-                let body = &p[ti.header_bytes..p.len() - 2];
+                let body = &p[header_bytes..p.len() - 2];
                 let what = match llid {
                     3 => format!("LMP opcode={}", body.first().map(|b| b >> 1).unwrap_or(0)),
                     2 => "L2CAP start".into(),
@@ -232,8 +246,13 @@ impl BrPacket {
                 }
             }
             s += " CRC ok";
+        } else if self.rate > 0 {
+            s += " payload CRC mismatch (encrypted or bit errors)";
         } else if self.payload.is_none() && type_info(pt).has_crc {
             s += " (payload not decoded)";
+        }
+        if let Some(q) = self.edr_quality {
+            s += &format!(" sync={q:.2}");
         }
         s
     }
@@ -245,6 +264,9 @@ pub struct Payload {
     pub bytes: Vec<u8>,
     pub crc_valid: Option<bool>,
     pub corrected: u32,
+    /// 0 = basic rate, 1 = EDR 2 Mbit/s, 2 = EDR 3 Mbit/s.
+    pub rate: u8,
+    pub edr_quality: Option<f32>,
 }
 
 fn dewhitened(coded_info: &[u8], clk6: u8) -> Vec<u8> {
@@ -269,6 +291,8 @@ pub fn decode_payload(coded: &[u8], soft: &[f32], ptype: u8, uap: u8, clk6: u8) 
             bytes: Vec::new(),
             crc_valid: None,
             corrected: 0,
+            rate: 0,
+            edr_quality: None,
         });
     }
     if !ti.has_crc || matches!(ptype, 12 | 13) {
@@ -329,7 +353,81 @@ pub fn decode_payload(coded: &[u8], soft: &[f32], ptype: u8, uap: u8, clk6: u8) 
         bytes,
         crc_valid: Some(crc_ok),
         corrected,
+        rate: 0,
+        edr_quality: None,
     })
+}
+
+/// Maximum EDR payload symbols (3-DH5 / 2-DH5 plus margin).
+const MAX_EDR_SYMBOLS: usize = 2750;
+
+/// Bits per symbol and maximum user payload of the EDR ACL packet types.
+pub fn edr_acl_type(ptype: u8) -> Option<(usize, usize)> {
+    match ptype {
+        4 => Some((2, 54)),
+        8 => Some((3, 83)),
+        10 => Some((2, 367)),
+        11 => Some((3, 552)),
+        14 => Some((2, 679)),
+        15 => Some((3, 1021)),
+        _ => None,
+    }
+}
+
+pub fn edr_type_name(ptype: u8) -> Option<&'static str> {
+    Some(match ptype {
+        4 => "2-DH1",
+        8 => "3-DH1",
+        10 => "2-DH3",
+        11 => "3-DH3",
+        14 => "2-DH5",
+        15 => "3-DH5",
+        _ => return None,
+    })
+}
+
+/// Interpret demodulated DPSK bits as an EDR ACL payload (2-byte payload
+/// header, body, CRC) for a guessed (UAP, clock).
+pub fn decode_edr_payload(dp: &DpskBits, ptype: u8, uap: u8, clk6: u8) -> Option<Payload> {
+    let (bps, max_len) = edr_acl_type(ptype)?;
+    if dp.bits.len() < 16 {
+        return None;
+    }
+    let hdr = dewhitened(&dp.bits[..16], clk6);
+    let len = bits::to_u64(&hdr[3..13]) as usize;
+    if len > max_len {
+        return None;
+    }
+    let total = (2 + len + 2) * 8;
+    if dp.bits.len() < total {
+        return None;
+    }
+    let bytes = bits::pack_lsb(&dewhitened(&dp.bits[..total], clk6));
+    let n = bytes.len();
+    let crc_ok = crc16(uap, &bytes[..n - 2]) == bytes[n - 2..];
+    Some(Payload {
+        bytes,
+        crc_valid: Some(crc_ok),
+        corrected: 0,
+        rate: (bps - 1) as u8,
+        edr_quality: Some(dp.sync_quality),
+    })
+}
+
+/// IQ samples of a packet and its lazily demodulated DPSK payloads.
+#[derive(Clone, Debug)]
+struct EdrCache {
+    ctx: EdrContext,
+    dqpsk: OnceCell<Option<DpskBits>>,
+    d8psk: OnceCell<Option<DpskBits>>,
+}
+
+impl EdrCache {
+    fn bits(&self, demod: &EdrDemod, bps: usize) -> Option<&DpskBits> {
+        let cell = if bps == 2 { &self.dqpsk } else { &self.d8psk };
+        cell.get_or_init(|| demod.demodulate(&self.ctx, bps, MAX_EDR_SYMBOLS))
+            .as_ref()
+    }
 }
 
 /// Can a packet of this TYPE, sent in the slot whose master clock is
@@ -370,6 +468,8 @@ struct RawPacket {
     air_bits: usize,
     signal_dbm: i8,
     noise_dbm: i8,
+    /// Samples for EDR demodulation (packets longer than POLL/NULL).
+    edr: Option<Box<EdrCache>>,
 }
 
 pub struct Piconet {
@@ -417,6 +517,10 @@ pub struct BrStats {
     pub header_packets: u64,
     pub decoded_headers: u64,
     pub crc_ok: u64,
+    /// Packets with an EDR (DPSK) payload detected.
+    pub edr_detected: u64,
+    /// EDR packets whose payload CRC is valid.
+    pub edr_crc_ok: u64,
 }
 
 pub struct BrDecoder {
@@ -424,6 +528,7 @@ pub struct BrDecoder {
     masks: [u32; 64],
     piconets: HashMap<u32, Piconet>,
     notes: Vec<String>,
+    edr: EdrDemod,
     pub stats: BrStats,
 }
 
@@ -438,6 +543,7 @@ impl BrDecoder {
             masks,
             piconets: HashMap::new(),
             notes: Vec::new(),
+            edr: EdrDemod::new(),
             stats: BrStats::default(),
         }
     }
@@ -453,7 +559,13 @@ impl BrDecoder {
     /// Search a demodulated burst for a BR access code; returns true if one
     /// was found (decoded packets may be delivered later, once the piconet's
     /// UAP is known).
-    pub fn process(&mut self, d: &Demodulated, info: &BurstInfo, out: &mut Vec<BrPacket>) -> bool {
+    pub fn process(
+        &mut self,
+        d: &Demodulated,
+        burst: &Burst,
+        info: &BurstInfo,
+        out: &mut Vec<BrPacket>,
+    ) -> bool {
         let Some(rf) = rf_channel_from_mhz(info.freq_mhz) else {
             return false;
         };
@@ -510,6 +622,8 @@ impl BrDecoder {
                 signal_dbm,
                 noise_dbm,
                 air_bits,
+                rate: 0,
+                edr_quality: None,
             });
             return true;
         }
@@ -536,6 +650,21 @@ impl BrDecoder {
             air_bits,
             signal_dbm,
             noise_dbm,
+            // An EDR packet is at least 126 + 5 + 11 + 16 + 2 us long.
+            edr: (air_bits >= 150).then(|| {
+                let per_bit = burst.sample_rate / 1e6;
+                Box::new(EdrCache {
+                    ctx: EdrContext {
+                        samples: burst.samples.clone(),
+                        sample_rate: burst.sample_rate,
+                        header_end: d.sample_of_bit0 + per_bit * (hdr_start + 54) as f64
+                            - per_bit / 2.0,
+                        cfo_hz: d.cfo_hz,
+                    },
+                    dqpsk: OnceCell::new(),
+                    d8psk: OnceCell::new(),
+                })
+            }),
         };
         if is_inquiry_lap(lap) {
             let pkt = self.decode_brute(&raw, 0, true);
@@ -565,6 +694,8 @@ impl BrDecoder {
             signal_dbm: raw.signal_dbm,
             noise_dbm: raw.noise_dbm,
             air_bits: raw.air_bits,
+            rate: 0,
+            edr_quality: None,
         }
     }
 
@@ -584,17 +715,53 @@ impl BrDecoder {
         pkt.hec_valid = header_valid(uap, h);
         self.stats.decoded_headers += 1;
         if let Some(pl) = payload {
+            pkt.rate = pl.rate;
+            pkt.edr_quality = pl.edr_quality;
+            if pl.rate > 0 {
+                self.stats.edr_detected += 1;
+            }
             if pl.crc_valid == Some(true) {
                 self.stats.crc_ok += 1;
-                pkt.transport = TRANSPORT_ACL;
+                if pl.rate > 0 {
+                    self.stats.edr_crc_ok += 1;
+                }
+                pkt.transport = TRANSPORT_ACL | pl.rate;
                 pkt.payload_corrected = pl.corrected as i16;
                 pkt.crc_valid = Some(true);
                 pkt.payload = Some(pl.bytes);
             } else if pl.crc_valid.is_none() {
                 pkt.payload = (!pl.bytes.is_empty()).then_some(pl.bytes);
+            } else if pl.rate > 0 {
+                // EDR modulation found but the payload CRC does not match
+                // (encrypted or bit errors): report the rate only.
+                pkt.transport = TRANSPORT_ANY | pl.rate;
             }
         }
         pkt
+    }
+
+    /// Decode a payload as basic rate and, failing that, as EDR.
+    fn decode_any(&self, raw: &RawPacket, ptype: u8, uap: u8, clk6: u8) -> Option<Payload> {
+        let br = decode_payload(&raw.payload_coded, &raw.payload_soft, ptype, uap, clk6);
+        if br.as_ref().is_some_and(|p| p.crc_valid == Some(true)) {
+            return br;
+        }
+        let (Some((bps, _)), Some(cache)) = (edr_acl_type(ptype), raw.edr.as_ref()) else {
+            return br;
+        };
+        let Some(dp) = cache.bits(&self.edr, bps) else {
+            return br;
+        };
+        match decode_edr_payload(dp, ptype, uap, clk6) {
+            Some(p) if p.crc_valid == Some(true) => Some(p),
+            _ => Some(Payload {
+                bytes: Vec::new(),
+                crc_valid: Some(false),
+                corrected: 0,
+                rate: (bps - 1) as u8,
+                edr_quality: Some(dp.sync_quality),
+            }),
+        }
     }
 
     /// Try all 64 clocks with a fixed UAP (inquiry: DCI = 0). With
@@ -610,7 +777,7 @@ impl BrDecoder {
             if !type_plausible(pt, raw.air_bits, c) {
                 continue;
             }
-            if let Some(pl) = decode_payload(&raw.payload_coded, &raw.payload_soft, pt, uap, c) {
+            if let Some(pl) = self.decode_any(raw, pt, uap, c) {
                 if pl.crc_valid == Some(true) {
                     return self.finish_packet(raw, uap, c, Some(pl));
                 }
@@ -669,7 +836,7 @@ impl BrDecoder {
             }
             let mut w = 1u16;
             if type_info(pt).has_crc {
-                if let Some(pl) = decode_payload(&raw.payload_coded, &raw.payload_soft, pt, u, c) {
+                if let Some(pl) = self.decode_any(&raw, pt, u, c) {
                     if pl.crc_valid == Some(true) {
                         w = 5;
                     }
@@ -752,7 +919,7 @@ impl BrDecoder {
                 continue;
             }
             let pt = ((h >> 3) & 0xF) as u8;
-            let pl = decode_payload(&raw.payload_coded, &raw.payload_soft, pt, uap, c);
+            let pl = self.decode_any(raw, pt, uap, c);
             let crc_ok = pl.as_ref().is_some_and(|p| p.crc_valid == Some(true));
             if crc_ok {
                 best = Some((c, pl, true));

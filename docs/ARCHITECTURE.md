@@ -65,11 +65,11 @@ So each output vector costs:
 Only the bins that map to selected channels are kept.
 
 - **Prototype filter:** Kaiser-windowed sinc, 65 dB stop band, −6 dB at
-  ±0.6 MHz. This is narrower than the LE signal's ~1.5 MHz occupied
-  bandwidth, but the benchmark shows it is the best choice for both LE
-  (h = 0.5) and BR (h = 0.32). Less noise reaches the burst detector and the
-  discriminator, while the GFSK main lobe passes; against ±0.8 MHz the LE
-  50% point improves by ~1.5 dB. The output Nyquist band is 2 MHz.
+  ±0.7 MHz, which passes the EDR spectrum (root-raised cosine, roll-off 0.4,
+  ±0.7 MHz). The GFSK demodulator narrows the band further to ±0.6 MHz (see
+  below). Against a single ±0.6 MHz filter this costs GFSK ~0.3 dB of
+  burst-detection sensitivity, and gains 8DPSK about 1 dB. The output
+  Nyquist band is 2 MHz.
 - **DC removal:** the HackRF LO leakage would land in the centre channel.
   It is removed with a block-mean estimate smoothed across blocks.
 - **Edge channels:** channels within 2 MHz of the band edge are skipped by
@@ -110,13 +110,21 @@ Bluetooth packets.
 LE 1M and BR both use 1 Msym/s GFSK (BT = 0.5). The modulation index is
 h ≈ 0.5 for LE and 0.28–0.35 for BR. Per burst:
 
+0. **Channel filter:** a 25-tap zero-phase low-pass at the channel rate,
+   −6 dB at ±0.6 MHz. Measured with the benchmark, this is the best
+   bandwidth for both LE and BR: narrower than the LE signal's ~1.5 MHz
+   occupied bandwidth, but it passes the GFSK main lobe and keeps noise out
+   of the discriminator. Zero-phase, so burst edges and timing stay aligned.
 1. **Interpolation:** 4× polyphase interpolation, 2 → 8 samples/symbol
    (49-tap Kaiser filter).
 2. **FM discriminator:** `arg(z[n]·z*[n−1])`, scaled to Hz.
 3. **Smoothing:** a one-symbol moving average, which approximates the
    matched filter for the frequency pulse.
-4. **Carrier offset:** the mean frequency over the burst core (whitened data
-   is balanced).
+4. **Carrier offset:** the mean frequency over the first 128 µs of the
+   burst core (whitened data is balanced). The window covers the LE
+   preamble/access address/header and the BR access code and header. These
+   are GFSK even when an EDR (DPSK) payload follows, which would otherwise
+   corrupt the CFO, timing and threshold estimates.
 5. **Symbol timing:** the sampling phase (1 of 8) with the largest mean
    |f − CFO| over the core, i.e. the widest eye.
 6. **Threshold refinement:** the midpoint between the mean of the positive
@@ -287,6 +295,40 @@ Supported types are FHS, DM1, DH1, DM3, DH3, DM5 and DH5:
 Types without a CRC (HV, AUX1, DV), eSCO packets, and EDR packets (whose
 payload is DPSK) are reported with their header only.
 
+### EDR payloads (`dsp/edr.rs`)
+
+An EDR packet sends its access code and header in GFSK. Then follow:
+- a guard time of 4.75–5.25 µs;
+- a DPSK synchronisation sequence: a reference symbol and ten symbols with
+  phase changes 3π/4, −3π/4, 3π/4, −3π/4, 3π/4, −3π/4, −3π/4, 3π/4, 3π/4,
+  3π/4;
+- the payload at 1 Msym/s, root-raised-cosine pulses with roll-off 0.4:
+  π/4-DQPSK (2 bits/symbol, Gray: 00→π/4, 01→3π/4, 11→−3π/4, 10→−π/4) or
+  8DPSK (3 bits/symbol, Gray: 000→0, 001→π/4, 011→π/2, 010→3π/4, 110→π,
+  111→−3π/4, 101→−π/2, 100→−π/4);
+- a two-symbol trailer.
+
+The demodulator works on the burst's channel samples:
+1. **Interpolation and offset removal:** interpolate ×4 and remove the
+   carrier offset measured on the GFSK part of the same packet.
+2. **Matched filter:** apply the RRC matched filter.
+3. **Timing:** try reference-symbol positions for guard times of 4.5–5.5 µs
+   in 1/8-symbol steps. Keep the one whose ten differential phases best
+   match the sync sequence (mean cos of the error; at least 0.5 is
+   required).
+4. **Residual frequency error:** estimate it from the sync sequence.
+5. **Detection:** detect each payload symbol differentially (nearest
+   constellation phase change) and track the residual error decision-
+   directed.
+
+The BR decoder tries this for packets whose basic-rate decoding fails the
+CRC and whose TYPE has an EDR ACL meaning: 4 = 2-DH1, 8 = 3-DH1, 10 = 2-DH3,
+11 = 3-DH3, 14 = 2-DH5, 15 = 3-DH5. The DPSK bits are computed once per
+packet and rate, then de-whitened, continuing the header's whitening
+sequence, for every (UAP, clock) hypothesis. Their 2-byte payload header and
+CRC are checked exactly as for basic rate. A valid CRC also feeds the
+piconet discovery votes.
+
 ## 7. Output formats (`pcap.rs`)
 
 PCAPNG files contain two interfaces, both with nanosecond timestamps
@@ -316,7 +358,7 @@ little-endian.
 | rf_channel | 0–78 |
 | signal_power, noise_power | dBFS |
 | access_code_offenses | corrected sync word bits |
-| payload_transport_rate | `0xFF` for ID packets, `0x30` (ACL, BR) for CRC-verified payloads, `0x00` otherwise |
+| payload_transport_rate | `0xFF` for ID packets, `0x30` / `0x31` / `0x32` (ACL, BR / EDR 2M / EDR 3M) for CRC-verified payloads, `0x01` / `0x02` for EDR detected without a valid CRC, `0x00` otherwise |
 | corrected_header_bits, corrected_payload_bits | FEC corrections |
 | lap | LAP |
 | ref_lap_uap | LAP \| UAP << 24 |
@@ -376,7 +418,8 @@ executable there and checks that the copy answers `--extcap-interfaces`.
 - **Sensitivity benchmark** (`examples/benchmark.rs`): packet success rate
   versus SNR on synthetic captures with impairments within the
   specification limits (carrier offset and drift, modulation index spread,
-  phase noise). The results are in the README.
+  phase noise). `--edr` measures each EDR packet type separately. The
+  results are in the README.
 - **Live tests with a HackRF One:**
   - LE advertising (CRC-valid packets from phones, printers and other nearby
     devices);
@@ -388,8 +431,8 @@ executable there and checks that the copy answers `--extcap-interfaces`.
 ## 9. Ideas for future work
 
 - LE 2M PHY (a second filter bank with 2 MHz channels) and LE Coded.
-- EDR payload demodulation (π/4-DQPSK, 8DPSK).
+- EDR symbol timing tracking for long packets, eSCO EDR payloads.
 - Following LE connections across the whole band with channel-selection
   algorithms #1/#2 and several receivers.
-- Soft-decision decoding and better timing recovery for weak signals.
+- Better timing recovery and soft-decision CRC repair for EDR payloads.
 - Multi-threaded decoding for very busy environments.

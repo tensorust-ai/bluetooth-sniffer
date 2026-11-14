@@ -21,6 +21,9 @@ use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
+/// Prototype filter -6 dB cutoff in channel spacings.
+pub const CUTOFF_SPACINGS: f64 = 0.7;
+
 pub struct Channelizer {
     m: usize,
     decim: usize,
@@ -57,11 +60,11 @@ impl Channelizer {
             "oversampling must divide M"
         );
         let l = m * taps_per_branch;
-        // -6 dB at +-0.6 channel spacings. Measured with the synthetic
-        // benchmark this beats wider filters for both LE (h = 0.5) and BR
-        // (h = 0.32): less noise reaches the discriminator and the burst
-        // detector, while the GFSK main lobe still passes.
-        let cutoff = 0.6 / m as f64;
+        // -6 dB at +-0.7 channel spacings: wide enough for the EDR (DPSK,
+        // root-raised-cosine 0.4) spectrum. The GFSK demodulator narrows the
+        // band further to +-0.6 MHz, which the benchmark shows is best for
+        // LE and BR GFSK.
+        let cutoff = CUTOFF_SPACINGS / m as f64;
         let proto = filter::lowpass(l, cutoff, filter::kaiser_beta(65.0));
         let taps_rev: Vec<f32> = proto.iter().rev().copied().collect();
         let mut planner = FftPlanner::new();

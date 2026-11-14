@@ -570,6 +570,7 @@ mod tests {
             core_end_bit: core.1,
             cfo_hz: 0.0,
             deviation_hz: 200e3,
+            sample_of_bit0: 0.0,
         }
     }
 

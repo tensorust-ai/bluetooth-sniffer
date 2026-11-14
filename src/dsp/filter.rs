@@ -58,6 +58,31 @@ pub fn lowpass(num_taps: usize, cutoff: f64, beta: f64) -> Vec<f32> {
     taps.into_iter().map(|t| t as f32).collect()
 }
 
+/// Root-raised-cosine pulse with roll-off `beta`, `sps` samples per symbol
+/// and a half-span of `span` symbols. Normalised so that a unit-amplitude
+/// symbol stream shaped with it has unit average power.
+pub fn root_raised_cosine(sps: usize, beta: f64, span: usize) -> Vec<f32> {
+    let n = 2 * span * sps + 1;
+    let h: Vec<f64> = (0..n)
+        .map(|i| {
+            let t = (i as f64 - (span * sps) as f64) / sps as f64;
+            if t.abs() < 1e-9 {
+                1.0 - beta + 4.0 * beta / PI
+            } else if (t.abs() - 1.0 / (4.0 * beta)).abs() < 1e-9 {
+                beta / 2f64.sqrt()
+                    * ((1.0 + 2.0 / PI) * (PI / (4.0 * beta)).sin()
+                        + (1.0 - 2.0 / PI) * (PI / (4.0 * beta)).cos())
+            } else {
+                ((PI * t * (1.0 - beta)).sin() + 4.0 * beta * t * (PI * t * (1.0 + beta)).cos())
+                    / (PI * t * (1.0 - (4.0 * beta * t).powi(2)))
+            }
+        })
+        .collect();
+    let energy: f64 = h.iter().map(|x| x * x).sum();
+    let scale = (sps as f64 / energy).sqrt();
+    h.iter().map(|x| (x * scale) as f32).collect()
+}
+
 /// Magnitude response (linear) of a real FIR at a normalised frequency.
 pub fn response(taps: &[f32], freq: f64) -> f64 {
     let (mut re, mut im) = (0.0f64, 0.0f64);

@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 pub const OVERSAMPLE: usize = 2;
 /// Prototype filter taps per PFB branch.
 pub const TAPS_PER_BRANCH: usize = 16;
+/// One-sided -6 dB bandwidth used by the GFSK demodulator.
+pub const GFSK_CUTOFF_HZ: f64 = 600e3;
 
 #[derive(Clone, Debug)]
 pub struct CaptureConfig {
@@ -245,7 +247,8 @@ pub fn run(
     )?;
 
     // ---- decoder (this thread)
-    let demod = GfskDemod::new(extra_delay);
+    // GFSK works best with a narrower channel than EDR needs.
+    let demod = GfskDemod::with_prefilter(extra_delay, GFSK_CUTOFF_HZ, fs_ch);
     let mut ble = cfg.ble.clone().map(BleDecoder::new);
     let mut br = cfg.bredr.clone().map(BrDecoder::new);
     if let Some(b) = ble.as_mut() {
@@ -303,7 +306,7 @@ pub fn run(
                 last_t = d.t0;
                 let mut found = false;
                 if let Some(b) = br.as_mut() {
-                    found = b.process(&d, &info, &mut br_pkts);
+                    found = b.process(&d, &burst, &info, &mut br_pkts);
                 }
                 if !found {
                     if let Some(b) = ble.as_mut() {

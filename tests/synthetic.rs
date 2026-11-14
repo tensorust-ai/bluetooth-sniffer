@@ -143,6 +143,24 @@ fn decodes_demo_scenario() {
         info.br_crc_packets
     );
 
+    // EDR: 2-DH1 / 2-DH3 (pi/4-DQPSK) and 3-DH1 (8DPSK) payloads with valid CRC
+    let edr: Vec<_> = pico
+        .iter()
+        .filter(|p| p.rate > 0 && p.crc_valid == Some(true))
+        .collect();
+    assert!(
+        ratio(edr.len(), info.br_edr_packets) > 0.9,
+        "EDR {}/{}",
+        edr.len(),
+        info.br_edr_packets
+    );
+    for p in &edr {
+        let expected_rate = if p.ptype() == Some(8) { 2 } else { 1 };
+        assert_eq!(p.rate, expected_rate, "{}", p.describe());
+        assert_eq!(p.transport, 0x30 | expected_rate);
+    }
+
+    // inquiry
     // inquiry
     let ids =
         c.br.iter()
