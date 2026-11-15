@@ -105,6 +105,20 @@ impl Channelizer {
         self.selected.len()
     }
 
+    /// Change the PFB bins to produce (after a retune). Buffered input and
+    /// filter history are kept; call [`skip`](Self::skip) to drop them.
+    pub fn set_selected(&mut self, selected: Vec<usize>) {
+        for &k in &selected {
+            assert!(k < self.m);
+        }
+        self.selected = selected;
+    }
+
+    /// Forget the DC offset estimate (after a retune).
+    pub fn reset_dc(&mut self) {
+        self.dc_init = false;
+    }
+
     /// Channel-rate index of the next output sample. Output `j` covers the
     /// input window ending at input sample `L - 1 + j * decimation`.
     pub fn next_output_index(&self) -> u64 {

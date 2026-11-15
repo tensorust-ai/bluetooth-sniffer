@@ -54,3 +54,10 @@ First release.
   locked piconets now de-whiten 95%+ of their headers live.
 - The EDR sync threshold was raised to 0.7, so non-standard DPSK packets are
   no longer reported as EDR.
+- Band sweep: `btsdr capture --sweep` retunes the HackRF through the whole
+  2.4 GHz band, every `--dwell` seconds (default 2).
+  - At 20 Msps there are 5 steps of 17 channels.
+  - The decoder state and the time base are kept across steps.
+  - `--sweep 2410,2427,2472` visits only the given centre frequencies.
+  - The extcap settings have a matching option.
+  - The status line shows the current centre frequency.

@@ -6,13 +6,13 @@
 //! Homebrew on macOS).
 
 use super::dynlib::DynLib;
-use super::{IqBlock, IqSource, SourceStats};
+use super::{IqBlock, IqSource, SourceStats, Sweep};
 use anyhow::{Context, anyhow, bail};
 use crossbeam_channel::{Sender, TrySendError};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[repr(C)]
@@ -275,7 +275,18 @@ pub struct HackRfConfig {
     pub bias_tee: bool,
     /// Print device settings and warnings on stderr.
     pub verbose: bool,
+    /// Retune through these centre frequencies (the first one replaces
+    /// `center_hz`).
+    pub sweep: Option<Sweep>,
 }
+
+/// The retune marker goes in front of the first USB buffer delivered after
+/// the retune was requested. That buffer and any filled but not yet delivered
+/// ones (at most the libhackrf transfer count, 4) can hold samples from the
+/// old frequency. Measured: the switch shows up within the first buffer.
+const RETUNE_STALE_BUFFERS: u64 = 5;
+/// Synthesizer settling time after the stale buffers, in seconds.
+const RETUNE_SETTLE_S: f64 = 1e-3;
 
 pub struct HackRfSource {
     cfg: HackRfConfig,
@@ -293,6 +304,10 @@ struct RxContext {
     samples: AtomicU64,
     dropped: AtomicU64,
     pending_gap: AtomicU64,
+    /// Centre frequency (MHz) of a retune not yet announced; 0 = none.
+    pending_retune: AtomicU32,
+    /// Samples of synthesizer settling time.
+    settle_samples: u64,
 }
 
 unsafe extern "C" fn rx_callback(t: *mut HackrfTransfer) -> c_int {
@@ -312,6 +327,28 @@ unsafe extern "C" fn rx_callback(t: *mut HackrfTransfer) -> c_int {
     if gap > 0 {
         match ctx.tx.try_send(IqBlock::Gap(gap)) {
             Ok(()) => ctx.pending_gap.store(0, Ordering::Relaxed),
+            Err(TrySendError::Full(_)) => {
+                ctx.pending_gap.fetch_add(ns, Ordering::Relaxed);
+                ctx.dropped.fetch_add(ns, Ordering::Relaxed);
+                return 0;
+            }
+            Err(TrySendError::Disconnected(_)) => return -1,
+        }
+    }
+    // Announce a retune before the first buffer delivered after it; that
+    // buffer and the following stale ones are covered by `settle`.
+    let center_mhz = ctx.pending_retune.load(Ordering::Relaxed);
+    if center_mhz != 0 {
+        let settle = RETUNE_STALE_BUFFERS * ns + ctx.settle_samples;
+        match ctx.tx.try_send(IqBlock::Retune { center_mhz, settle }) {
+            Ok(()) => {
+                let _ = ctx.pending_retune.compare_exchange(
+                    center_mhz,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
             Err(TrySendError::Full(_)) => {
                 ctx.pending_gap.fetch_add(ns, Ordering::Relaxed);
                 ctx.dropped.fetch_add(ns, Ordering::Relaxed);
@@ -365,7 +402,11 @@ impl IqSource for HackRfSource {
                 samples: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
                 pending_gap: AtomicU64::new(0),
+                pending_retune: AtomicU32::new(0),
+                settle_samples: (RETUNE_SETTLE_S * c.sample_rate) as u64,
             });
+            let sweep = c.sweep.as_ref().filter(|s| !s.centers_mhz.is_empty());
+            let center_hz = sweep.map_or(c.center_hz, |s| s.centers_mhz[0] as u64 * 1_000_000);
             let ctx_ptr = &*ctx as *const RxContext as *mut c_void;
             let result = (|| -> anyhow::Result<SourceStats> {
                 api.check("set_sample_rate", (api.set_sample_rate)(dev, c.sample_rate))?;
@@ -377,7 +418,7 @@ impl IqSource for HackRfSource {
                     "set_baseband_filter_bandwidth",
                     (api.set_baseband_filter_bandwidth)(dev, bw),
                 )?;
-                api.check("set_freq", (api.set_freq)(dev, c.center_hz))?;
+                api.check("set_freq", (api.set_freq)(dev, center_hz))?;
                 api.check("set_amp_enable", (api.set_amp_enable)(dev, c.amp as u8))?;
                 api.check("set_lna_gain", (api.set_lna_gain)(dev, c.lna_gain))?;
                 api.check("set_vga_gain", (api.set_vga_gain)(dev, c.vga_gain))?;
@@ -389,7 +430,7 @@ impl IqSource for HackRfSource {
                     eprintln!(
                         "HackRF: {} | {:.3} MHz, {:.1} Msps, baseband filter {:.2} MHz, LNA {} dB, VGA {} dB, amp {}",
                         api.path,
-                        c.center_hz as f64 / 1e6,
+                        center_hz as f64 / 1e6,
                         c.sample_rate / 1e6,
                         bw as f64 / 1e6,
                         c.lna_gain,
@@ -398,12 +439,42 @@ impl IqSource for HackRfSource {
                     );
                 }
                 api.check("start_rx", (api.start_rx)(dev, rx_callback, ctx_ptr))?;
+                // Sweep schedule, in samples so that it follows the stream.
+                let dwell = sweep.map(|s| ((s.dwell * c.sample_rate) as u64).max(1));
+                let mut step = 0usize;
+                let mut next_retune = dwell.unwrap_or(u64::MAX);
+                let mut retune_error = None;
                 while !stop.load(Ordering::Relaxed) && (api.is_streaming)(dev) == 1 {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(10));
+                    let (Some(sw), Some(dwell)) = (sweep, dwell) else {
+                        continue;
+                    };
+                    let n = ctx.samples.load(Ordering::Relaxed);
+                    if sw.centers_mhz.len() < 2 || n < next_retune {
+                        continue;
+                    }
+                    step = (step + 1) % sw.centers_mhz.len();
+                    let f = sw.centers_mhz[step];
+                    // Announce first: every buffer delivered after the marker
+                    // is covered by the settling time, so no sample from the
+                    // new frequency is processed with the old channel map.
+                    ctx.pending_retune.store(f, Ordering::Relaxed);
+                    if let Err(e) = api.check("set_freq", (api.set_freq)(dev, f as u64 * 1_000_000))
+                    {
+                        retune_error = Some(e);
+                        break;
+                    }
+                    // stay on a fixed time grid: step k starts at k * dwell
+                    while next_retune <= n {
+                        next_retune += dwell;
+                    }
                 }
-                let streaming_ended = !stop.load(Ordering::Relaxed);
+                let streaming_ended = !stop.load(Ordering::Relaxed) && retune_error.is_none();
                 stop.store(true, Ordering::Relaxed);
                 (api.stop_rx)(dev);
+                if let Some(e) = retune_error {
+                    return Err(e);
+                }
                 let st = SourceStats {
                     samples: ctx.samples.load(Ordering::Relaxed),
                     dropped: ctx.dropped.load(Ordering::Relaxed),

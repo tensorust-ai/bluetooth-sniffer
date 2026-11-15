@@ -7,9 +7,9 @@ use btsdr::pcap::{
 };
 use btsdr::pipeline::{self, CaptureConfig};
 use btsdr::report::Reporter;
-use btsdr::source::IqSource;
 use btsdr::source::file::{FileSource, IqFormat};
 use btsdr::source::hackrf::{self, HackRfConfig, HackRfSource};
+use btsdr::source::{IqSource, Sweep};
 use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
 use std::fs::File;
@@ -80,6 +80,19 @@ struct CaptureArgs {
     /// at least 2 MHz inside the captured band)
     #[arg(short = 'c', long)]
     channels: Option<String>,
+    /// Sweep the whole 2.4 GHz band, retuning every --dwell seconds (HackRF only).
+    /// Optionally give the centre frequencies to visit, e.g. "2410,2427,2472" (MHz)
+    #[arg(
+        long,
+        value_name = "CENTERS",
+        num_args = 0..=1,
+        default_missing_value = "all",
+        conflicts_with_all = ["center", "channels", "input", "record"]
+    )]
+    sweep: Option<String>,
+    /// Seconds on each centre frequency when sweeping
+    #[arg(long, default_value_t = 2.0, requires = "sweep")]
+    dwell: f64,
 
     /// Read IQ samples from a file instead of a HackRF
     #[arg(short = 'i', long, value_name = "FILE")]
@@ -210,10 +223,41 @@ fn open_output(path: &Path) -> anyhow::Result<(Box<dyn Write + Send>, bool)> {
     }
 }
 
+/// Parse `--sweep [CENTERS]`.
+fn parse_sweep(spec: &str, rate: u32, dwell: f64) -> anyhow::Result<Sweep> {
+    if dwell < MIN_DWELL_S {
+        bail!("--dwell must be at least {MIN_DWELL_S} s");
+    }
+    let centers_mhz = if spec == "all" {
+        pipeline::sweep_centers(rate)
+    } else {
+        let v = btsdr::extcap::parse_channel_list(spec)?;
+        if v.is_empty() {
+            bail!("--sweep needs at least one centre frequency");
+        }
+        for &c in &v {
+            if CaptureConfig::default_channels(c, rate).is_empty() {
+                bail!("sweep centre {c} MHz has no Bluetooth channel inside the captured band");
+            }
+        }
+        v
+    };
+    Ok(Sweep { centers_mhz, dwell })
+}
+
+/// Shortest dwell time: a retune discards up to ~0.2 s of samples at low
+/// sample rates.
+const MIN_DWELL_S: f64 = 0.5;
+
 fn capture(a: CaptureArgs) -> anyhow::Result<()> {
+    let sweep = match &a.sweep {
+        Some(spec) => Some(parse_sweep(spec, a.rate, a.dwell)?),
+        None => None,
+    };
+    let center = sweep.as_ref().map_or(a.center, |s| s.centers_mhz[0]);
     let channels = match &a.channels {
         Some(s) => btsdr::extcap::parse_channel_list(s)?,
-        None => CaptureConfig::default_channels(a.center, a.rate),
+        None => CaptureConfig::default_channels(center, a.rate),
     };
     let mut sinks: Vec<Box<dyn PacketSink>> = Vec::new();
     let mut stdout_used = false;
@@ -280,7 +324,7 @@ fn capture(a: CaptureArgs) -> anyhow::Result<()> {
         None => Box::new(HackRfSource::new(HackRfConfig {
             serial: a.serial.clone(),
             library: a.hackrf_lib.clone(),
-            center_hz: a.center as u64 * 1_000_000,
+            center_hz: center as u64 * 1_000_000,
             sample_rate: a.rate as f64 * 1e6,
             baseband_filter_hz: a.bb_filter.map(|m| (m * 1e6) as u32),
             lna_gain: a.lna.min(40) / 8 * 8,
@@ -288,6 +332,7 @@ fn capture(a: CaptureArgs) -> anyhow::Result<()> {
             amp: a.amp,
             bias_tee: a.bias_tee,
             verbose: true,
+            sweep: sweep.clone(),
         })),
     };
     let wall_start_ns = SystemTime::now()
@@ -295,7 +340,7 @@ fn capture(a: CaptureArgs) -> anyhow::Result<()> {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let cfg = CaptureConfig {
-        center_mhz: a.center,
+        center_mhz: center,
         sample_rate_mhz: a.rate,
         channels_mhz: channels.clone(),
         squelch_db: a.squelch,
@@ -307,17 +352,38 @@ fn capture(a: CaptureArgs) -> anyhow::Result<()> {
         wall_start_ns,
         status_interval: (a.status > 0.0).then_some(a.status),
     };
-    eprintln!(
-        "btsdr {}: {} MHz +- {} MHz, decoding {} channels ({}..{} MHz){}{}",
-        env!("CARGO_PKG_VERSION"),
-        a.center,
-        a.rate / 2,
-        channels.len(),
-        channels.first().copied().unwrap_or(0),
-        channels.last().copied().unwrap_or(0),
+    let decoders = format!(
+        "{}{}",
         if cfg.ble.is_some() { ", LE" } else { "" },
-        if cfg.bredr.is_some() { ", BR" } else { "" },
+        if cfg.bredr.is_some() { ", BR" } else { "" }
     );
+    match &sweep {
+        Some(s) => {
+            let all: Vec<u32> = s
+                .centers_mhz
+                .iter()
+                .flat_map(|&c| CaptureConfig::default_channels(c, a.rate))
+                .collect();
+            let list: Vec<String> = s.centers_mhz.iter().map(|c| c.to_string()).collect();
+            eprintln!(
+                "btsdr {}: sweeping {} MHz, {:.1} s each, covering {}..{} MHz{decoders}",
+                env!("CARGO_PKG_VERSION"),
+                list.join(", "),
+                s.dwell,
+                all.iter().min().copied().unwrap_or(0),
+                all.iter().max().copied().unwrap_or(0),
+            );
+        }
+        None => eprintln!(
+            "btsdr {}: {} MHz +- {} MHz, decoding {} channels ({}..{} MHz){decoders}",
+            env!("CARGO_PKG_VERSION"),
+            center,
+            a.rate / 2,
+            channels.len(),
+            channels.first().copied().unwrap_or(0),
+            channels.last().copied().unwrap_or(0),
+        ),
+    }
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();

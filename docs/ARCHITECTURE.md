@@ -42,6 +42,41 @@ found. Device settings:
 
 The callback context outlives `hackrf_close()`, which joins the USB thread.
 
+### Band sweep
+
+With a `Sweep` (centre frequencies and a dwell time) the source thread
+retunes the HackRF while it streams:
+
+- **Schedule:** it follows the sample counter on a fixed grid, so step `k`
+  starts at sample `k · dwell · fs`.
+- **Retune order:** the source first marks a retune as pending and then
+  calls `hackrf_set_freq`. The callback puts a
+  `Retune { center_mhz, settle }` marker in the stream, in front of the
+  first USB buffer it delivers after that.
+- **Why that order:** every sample from the new frequency comes after the
+  marker. The samples that follow the marker can still be from the old
+  frequency: the buffer being filled, and any filled buffers not yet
+  delivered (at most the 4 libhackrf transfers).
+- **`settle`:** 5 buffers plus 1 ms of synthesizer settling, about 34 ms at
+  20 Msps (buffers are 131072 samples).
+- **Measured:** alternating between an LTE downlink and the quiet Bluetooth
+  band, the power changed within the first buffer after the marker, and
+  never before it.
+
+On a marker the DSP thread:
+- selects the PFB bins of the new channel set
+  (`CaptureConfig::default_channels` of the new centre);
+- resets the DC estimate;
+- drops the filter history (`skip(0)`);
+- creates new burst detectors with the new frequencies;
+- skips the next `settle` input samples like a gap.
+
+The sample counter, and with it the time base, continues across the retune.
+The decoders are not touched, so piconet clocks, UAPs and LE connections
+survive the steps. `pipeline::sweep_centers` chooses the steps: as few
+centres as needed to cover 2402–2480 MHz with full channel sets, e.g. 2410,
+2427, 2444, 2461 and 2472 MHz at 20 Msps.
+
 `file.rs` reads `ci8` (HackRF native), `cu8`, `ci16` and `cf32` recordings.
 
 The DSP thread also counts samples whose I or Q is at full scale. ADC
@@ -433,7 +468,10 @@ executable there and checks that the copy answers `--extcap-interfaces`.
 - **End-to-end test** (`tests/synthetic.rs`): the scenario generator in
   `synth.rs` produces LE advertising, an announced and a hidden connection,
   a BR piconet and inquiry traffic. The whole pipeline must decode it at
-  25 dB SNR and degrade gracefully at 14 dB.
+  25 dB SNR and degrade gracefully at 14 dB. A second test inserts a retune
+  marker: packets before it must keep the old channels, packets after it
+  must get the new ones with continuous timestamps, and a packet inside the
+  settling time must be dropped.
 - **Sensitivity benchmark** (`examples/benchmark.rs`): packet success rate
   versus SNR on synthetic captures with impairments within the
   specification limits (carrier offset and drift, modulation index spread,
@@ -451,7 +489,11 @@ executable there and checks that the copy answers `--extcap-interfaces`.
     L2CAP lengths;
   - live streaming into Wireshark;
   - the extcap interfaces through tshark: listing, option passing, LE and
-    BR/EDR link types in one stream, clean stop and error reporting.
+    BR/EDR link types in one stream, clean stop and error reporting;
+  - the band sweep: in 40 s, 1063 packets, each on a channel of the step it
+    was received in, and LE advertising decoded on all three advertising
+    channels (their whitening depends on the channel, so a wrong channel map
+    would fail the CRC).
 
 ## 9. Ideas for future work
 

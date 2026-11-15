@@ -22,6 +22,7 @@ use crate::pcap::{
 };
 use crate::pipeline::{self, CaptureConfig};
 use crate::report::Reporter;
+use crate::source::Sweep;
 use crate::source::hackrf::{HackRfConfig, HackRfSource};
 use anyhow::{Context, bail};
 use std::collections::HashMap;
@@ -231,7 +232,17 @@ pub fn config_text() -> String {
     arg(
         12,
         "{call=--record}{display=Also save raw IQ to}{type=fileselect}{mustexist=false}\
-         {tooltip=Optional signed 8-bit IQ recording for later offline analysis}{group=Device}",
+         {tooltip=Optional signed 8-bit IQ recording for later offline analysis (not with a sweep)}{group=Device}",
+    );
+    arg(
+        13,
+        "{call=--sweep}{display=Sweep the whole band}{type=boolflag}{default=false}\
+         {tooltip=Retune through all 79 channels, ignoring the centre frequency and channel list}{group=Radio}",
+    );
+    arg(
+        14,
+        "{call=--dwell}{display=Sweep dwell time (s)}{type=double}{range=0.5,60}{default=2}\
+         {tooltip=Time on each centre frequency when sweeping}{group=Radio}",
     );
     for (rate, chans, default) in [
         (20, 17, true),
@@ -315,9 +326,27 @@ fn capture(a: &ExtcapArgs, iface: &Interface) -> anyhow::Result<()> {
     {
         bail!("capture filters are not supported; use a display filter such as btle or btbredr_rf");
     }
-    let center: u32 = opt_num(a, "--center", 2426)?;
     let rate: u32 = opt_num(a, "--rate", 20)?;
-    let channels = match opt_str(a, "--channels") {
+    let sweep = if opt_flag(a, "--sweep") {
+        let dwell: f64 = opt_num(a, "--dwell", 2.0)?;
+        if dwell < 0.5 {
+            bail!("the sweep dwell time must be at least 0.5 s");
+        }
+        if opt_str(a, "--record").is_some() {
+            bail!("a raw IQ recording cannot be combined with a sweep");
+        }
+        Some(Sweep {
+            centers_mhz: pipeline::sweep_centers(rate),
+            dwell,
+        })
+    } else {
+        None
+    };
+    let center: u32 = match &sweep {
+        Some(s) => s.centers_mhz[0],
+        None => opt_num(a, "--center", 2426)?,
+    };
+    let channels = match opt_str(a, "--channels").filter(|_| sweep.is_none()) {
         Some(s) => parse_channel_list(s)?,
         None => CaptureConfig::default_channels(center, rate),
     };
@@ -344,6 +373,7 @@ fn capture(a: &ExtcapArgs, iface: &Interface) -> anyhow::Result<()> {
         amp: opt_flag(a, "--amp"),
         bias_tee: opt_flag(a, "--bias-tee"),
         verbose: false,
+        sweep,
     }));
     let cfg = CaptureConfig {
         center_mhz: center,
@@ -587,7 +617,7 @@ mod tests {
         let c = config_text();
         assert_eq!(
             c.lines().filter(|l| l.starts_with("arg {number=")).count(),
-            13
+            15
         );
         assert_eq!(
             c.lines().filter(|l| l.contains("{default=true}")).count(),

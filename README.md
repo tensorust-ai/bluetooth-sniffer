@@ -26,6 +26,8 @@ HackRF One ──► channelizer (PFB) ──► burst detector ──► GFSK d
   piconets hopping at 1600 hops/s and LE connections hopping on all 37 data
   channels.
 - Wi-Fi and other wideband interference is detected and discarded early.
+- Band sweep (`--sweep`): the HackRF retunes through the whole 2.4 GHz band,
+  and piconet clocks and LE connections are kept across the steps.
 
 **Bluetooth Low Energy (LE 1M PHY)**
 - Advertising on the primary and secondary channels: `ADV_IND`,
@@ -190,7 +192,8 @@ appear:
 | Bluetooth BR/EDR sniffer (HackRF One) | BR only |
 
 The gear icon next to an interface opens its settings:
-- centre frequency, sample rate and channel list;
+- centre frequency, sample rate and channel list, or a sweep of the whole
+  band with its dwell time;
 - LNA/VGA gain and the RF amplifier;
 - squelch and decoder options;
 - HackRF serial number, bias tee, libhackrf path and an optional raw IQ
@@ -242,6 +245,35 @@ The centre frequency must be an integer number of MHz.
 - An LE connection is visible whenever one of its connection events falls
   into the window.
 
+### Sweeping the whole band
+
+To see everything around you, let the HackRF retune through the band:
+
+```bash
+btsdr capture --sweep -w sweep.pcapng
+```
+
+At 20 Msps this visits 2410, 2427, 2444, 2461 and 2472 MHz, 2 s each
+(`--dwell`), and covers all 79 channels. The first, second and last steps
+contain the LE advertising channels.
+
+- **Trade-off:** each channel is monitored only a fifth of the time. A fixed
+  window is better for following one device; the sweep gives an overview of
+  all devices.
+- **State is kept:** one decoder runs across all steps, so a piconet's UAP and
+  clock and an LE connection's parameters survive a retune. The time base
+  stays continuous.
+- **Settling time:** after each retune about 35 ms of samples are discarded
+  at 20 Msps. These are buffered samples from the old frequency and the
+  synthesizer settling. At lower sample rates up to about 0.2 s is
+  discarded, so `--dwell` must be at least 0.5 s.
+- **Custom steps:** `--sweep 2410,2427,2472` visits only the given centre
+  frequencies.
+- **Limits:** a sweep needs a live HackRF. It cannot be combined with
+  `--record`, `--center` or `--channels`.
+- **Wireshark:** the extcap settings have the same option ("Sweep the whole
+  band").
+
 ## Command reference
 
 ### `btsdr capture`
@@ -253,6 +285,8 @@ Capture and decode, live from a HackRF or from a file (`-i`).
 | `-f, --center <MHz>` | 2426 | Centre frequency |
 | `-s, --rate <Msps>` | 20 | Sample rate, an even number from 4 to 20; one channel per Msps |
 | `-c, --channels <list>` | auto | Channels to decode, e.g. `2402,2426,2430-2434` |
+| `--sweep [MHz,...]` | | Sweep the whole band, or the given centre frequencies |
+| `--dwell <s>` | 2 | Time on each centre frequency when sweeping (at least 0.5) |
 | `-w, --pcapng <file>` | | Write LE and BR packets to one PCAPNG file (`-` = stdout) |
 | `--ble-pcap <file>` | | LE only, PCAP with link type 256 |
 | `--bredr-pcap <file>` | | BR only, PCAP with link type 255 |
@@ -424,8 +458,10 @@ contains overlapping transmissions.
     packets with their header only.
   - Unencrypted EDR traffic for a test can be generated with BlueZ, e.g.
     `l2ping -s 600 <bdaddr>`.
-- **No frequency hopping:** btsdr monitors a fixed window of up to 20 MHz.
-  Traffic outside it is not seen.
+- **No hop following:** btsdr monitors a fixed window of up to 20 MHz, or
+  sweeps the band in steps (`--sweep`). It does not follow the hopping of
+  one piconet or connection, so traffic outside the current window is not
+  seen.
 - **No decryption:** encrypted payloads stay encrypted. On E0-encrypted
   links the CRC cannot be checked either, so such BR/EDR packets are written
   with their header only. A valid BR CRC
@@ -443,7 +479,9 @@ contains overlapping transmissions.
   - Classic inquiry;
   - piconet UAP/clock discovery and BR payloads with valid CRC;
   - EDR 2-DH1 (π/4-DQPSK) and 3-DH1 (8DPSK) packets with valid CRC and
-    readable L2CAP.
+    readable L2CAP;
+  - the band sweep: in a 40 s test all 1063 decoded packets were assigned to
+    the channels of the step they were received in.
 
   The end-to-end tests with synthetic signals and the codec cross-checks
   against reference tables cover the rest. Reports from other environments

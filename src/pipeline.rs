@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Oversampling of the channelizer outputs (2 samples per 1 Msym/s symbol).
@@ -63,20 +63,42 @@ impl CaptureConfig {
         if self.channels_mhz.is_empty() {
             bail!("no Bluetooth channels inside the captured bandwidth");
         }
-        let mut bins = Vec::new();
-        for &f in &self.channels_mhz {
-            let k = f as i64 - self.center_mhz as i64;
+        channel_bins(self.center_mhz, m, &self.channels_mhz)
+    }
+}
+
+/// PFB bins of `channels` (MHz) for a capture centred at `center_mhz` with
+/// `m` 1 MHz channels.
+fn channel_bins(center_mhz: u32, m: usize, channels: &[u32]) -> anyhow::Result<Vec<usize>> {
+    channels
+        .iter()
+        .map(|&f| {
+            let k = f as i64 - center_mhz as i64;
             if k.abs() >= (m / 2) as i64 {
                 bail!(
-                    "channel {f} MHz is outside the captured band ({} MHz +- {} MHz)",
-                    self.center_mhz,
+                    "channel {f} MHz is outside the captured band ({center_mhz} MHz +- {} MHz)",
                     m / 2
                 );
             }
-            bins.push(k.rem_euclid(m as i64) as usize);
-        }
-        Ok(bins)
+            Ok(k.rem_euclid(m as i64) as usize)
+        })
+        .collect()
+}
+
+/// Centre frequencies (MHz) of a sweep over all 79 Bluetooth channels, each
+/// step decoding [`CaptureConfig::default_channels`]. At 20 Msps: 2410, 2427,
+/// 2444, 2461 and 2472 MHz; the first and the last contain the LE advertising
+/// channels 2402 and 2480 MHz, the second one 2426 MHz.
+pub fn sweep_centers(rate_mhz: u32) -> Vec<u32> {
+    let half = (rate_mhz / 2).saturating_sub(2);
+    let mut v = Vec::new();
+    let mut c = 2402 + half;
+    while c + half < 2480 {
+        v.push(c);
+        c += 2 * half + 1;
     }
+    v.push(2480 - half);
+    v
 }
 
 #[derive(Default, Debug, Clone)]
@@ -173,33 +195,74 @@ pub fn run(
     };
     let channels = cfg.channels_mhz.clone();
     let squelch = cfg.squelch_db;
+    let rate_mhz = cfg.sample_rate_mhz;
     let dsp_stop = stop.clone();
     let clipped = Arc::new(AtomicU64::new(0));
     let dsp_clipped = clipped.clone();
+    // current centre frequency; changes when a sweeping source retunes
+    let tuned = Arc::new(AtomicU32::new(cfg.center_mhz));
+    let dsp_tuned = tuned.clone();
     let mut last_clipped = (0u64, 0u64); // (clipped, samples) at the last status line
     let chz = Channelizer::new(m, OVERSAMPLE, TAPS_PER_BRANCH, bins);
     let extra_delay = -chz.delay_samples() / fs_in;
     let dsp_thread = std::thread::Builder::new().name("dsp".into()).spawn(
         move || -> anyhow::Result<DspResult> {
             let mut chz = chz;
+            let mut channels = channels;
             let params = BurstParams::for_rate(fs_ch, squelch);
-            let mut dets: Vec<BurstDetector> = channels
-                .iter()
-                .map(|&f| BurstDetector::new(f, fs_ch, params))
-                .collect();
+            let new_detectors = |chans: &[u32], next_index: u64| -> Vec<BurstDetector> {
+                chans
+                    .iter()
+                    .map(|&f| {
+                        let mut d = BurstDetector::new(f, fs_ch, params);
+                        d.resync(next_index);
+                        d
+                    })
+                    .collect()
+            };
+            let mut dets = new_detectors(&channels, 0);
             let mut outs = vec![Vec::new(); channels.len()];
             let mut samples = 0u64;
             let mut nbursts = 0u64;
             let mut wideband = 0u64;
             let mut bursts = Vec::new();
+            // input samples still to be discarded after a retune
+            let mut discard = 0u64;
             for block in rx_iq.iter() {
+                // Samples at the start of this block that belong to the
+                // settling time of a retune.
+                let settling = discard.min(block.num_samples());
+                if settling > 0 {
+                    discard -= settling;
+                    chz.skip(settling);
+                    let j = chz.next_output_index();
+                    for d in &mut dets {
+                        d.resync(j);
+                    }
+                }
+                let k = settling as usize;
                 match &block {
+                    IqBlock::Retune { center_mhz, settle } => {
+                        if record.is_some() {
+                            bail!("a raw IQ recording cannot be combined with a sweep");
+                        }
+                        channels = CaptureConfig::default_channels(*center_mhz, rate_mhz);
+                        chz.set_selected(channel_bins(*center_mhz, m, &channels)?);
+                        chz.reset_dc();
+                        // drop the filter history from the old frequency
+                        chz.skip(0);
+                        dets = new_detectors(&channels, chz.next_output_index());
+                        outs = vec![Vec::new(); channels.len()];
+                        discard = *settle;
+                        dsp_tuned.store(*center_mhz, Ordering::Relaxed);
+                        continue;
+                    }
                     IqBlock::Ci8(v) => {
                         if let Some(r) = record.as_mut() {
                             r.write_all(v)?;
                         }
                         dsp_clipped.fetch_add(count_clipped_ci8(v), Ordering::Relaxed);
-                        chz.push_ci8(v);
+                        chz.push_ci8(&v[2 * k..]);
                     }
                     IqBlock::Cf32(v) => {
                         if let Some(r) = record.as_mut() {
@@ -214,14 +277,14 @@ pub fn run(
                                 .collect();
                             r.write_all(&b)?;
                         }
-                        chz.push_cf32(v);
+                        chz.push_cf32(&v[k..]);
                     }
                     IqBlock::Gap(n) => {
                         if let Some(r) = record.as_mut() {
                             // keep the recording's time base intact
                             r.write_all(&vec![0u8; (*n as usize) * 2])?;
                         }
-                        chz.skip(*n);
+                        chz.skip(*n - settling);
                         let j = chz.next_output_index();
                         for d in &mut dets {
                             d.resync(j);
@@ -384,8 +447,9 @@ pub fn run(
                     String::new()
                 };
                 reporter.status(&format!(
-                    "[{:>8.1} s] bursts {} | BLE {} | BR {} | queue {}{clip}",
+                    "[{:>8.1} s] {} MHz | bursts {} | BLE {} | BR {} | queue {}{clip}",
                     last_t,
+                    tuned.load(Ordering::Relaxed),
                     stats.bursts,
                     stats.ble_packets,
                     stats.br_packets,
@@ -431,4 +495,29 @@ pub fn run(
         return Err(e);
     }
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_covers_the_band() {
+        assert_eq!(sweep_centers(20), vec![2410, 2427, 2444, 2461, 2472]);
+        for rate in (4..=20).step_by(2) {
+            let centers = sweep_centers(rate);
+            let mut covered: Vec<u32> = centers
+                .iter()
+                .flat_map(|&c| CaptureConfig::default_channels(c, rate))
+                .collect();
+            covered.sort_unstable();
+            covered.dedup();
+            assert_eq!(covered, (2402..=2480).collect::<Vec<_>>(), "rate {rate}");
+            // every step decodes its full channel set inside the band
+            for c in centers {
+                let n = CaptureConfig::default_channels(c, rate).len();
+                assert_eq!(n as u32, 2 * (rate / 2 - 2) + 1, "rate {rate} centre {c}");
+            }
+        }
+    }
 }

@@ -208,3 +208,94 @@ fn degrades_gracefully_at_low_snr() {
         info.br_packets
     );
 }
+
+/// A sweeping receiver retunes in the middle of the stream. Packets before
+/// the retune belong to the old band and packets after it to the new one;
+/// the settling samples after the retune are discarded, and the time base
+/// continues across it.
+#[test]
+fn follows_a_retune() {
+    use btsdr::ble;
+    use btsdr::synth::{BLE_DEV, Scene, adv_ind, ble_packet_bits};
+    let fs = 20e6;
+    let step = 0.04; // seconds per sweep step
+    let settle = 0.008; // seconds discarded after the retune
+    let period = 0.004;
+    let (addr_a, addr_b, addr_s) = (
+        [0x0A, 0, 0, 0, 0, 0xC0],
+        [0x0B, 0, 0, 0, 0, 0xC0],
+        [0x05, 0, 0, 0, 0, 0xC0],
+    );
+    let adv = |addr, ch| ble_packet_bits(ble::ADV_AA, ble::ADV_CRC_INIT, &adv_ind(addr, "x"), ch);
+    // step 1: centre 2426 MHz, advertising on channel 38 (2426 MHz)
+    let mut a = Scene::new(fs, 2426, step);
+    let mut times_a = Vec::new();
+    let mut t = 0.002;
+    while t < step - 0.002 {
+        a.add(t, 2426, &adv(addr_a, 38), BLE_DEV, 0.25, 0.0);
+        times_a.push(t);
+        t += period;
+    }
+    // step 2: centre 2472 MHz, advertising on channel 39 (2480 MHz). The
+    // packet inside the settling time (after the burst detectors' 2 ms
+    // warm-up) would decode if it were not dropped.
+    let mut b = Scene::new(fs, 2472, step);
+    b.add(0.005, 2480, &adv(addr_s, 39), BLE_DEV, 0.25, 0.0);
+    let mut times_b = Vec::new();
+    let mut t = settle + 0.002;
+    while t < step - 0.002 {
+        b.add(t, 2480, &adv(addr_b, 39), BLE_DEV, 0.25, 0.0);
+        times_b.push(step + t);
+        t += period;
+    }
+    let noise_rms = 0.25 / 10f32.powf(25.0 / 20.0) * (fs as f32 / 1e6).sqrt();
+    let mut data = a.to_ci8(noise_rms, 1);
+    data.extend(b.to_ci8(noise_rms, 2));
+    let source = MemorySource::new(data).retune_at((step * fs) as u64, 2472, (settle * fs) as u64);
+
+    let cfg = CaptureConfig {
+        center_mhz: 2426,
+        sample_rate_mhz: 20,
+        channels_mhz: CaptureConfig::default_channels(2426, 20),
+        squelch_db: 8.0,
+        ble: Some(BleConfig::default()),
+        bredr: None,
+        follow: vec![],
+        max_duration: None,
+        record: None,
+        wall_start_ns: 0,
+        status_interval: None,
+    };
+    let out = Arc::new(Mutex::new(Collected::default()));
+    let mut rep = Reporter::new(Box::new(std::io::sink()), true, false);
+    pipeline::run(
+        Box::new(source),
+        cfg,
+        vec![Box::new(Collect(out.clone()))],
+        &mut rep,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let c = out.lock().unwrap();
+    let from = |addr: [u8; 6]| -> Vec<&BlePacket> {
+        c.ble
+            .iter()
+            .filter(|p| p.crc_valid && ble::adv_address(&p.pdu).is_some_and(|(a, _)| a == addr))
+            .collect()
+    };
+    let (pa, pb) = (from(addr_a), from(addr_b));
+    assert_eq!(pa.len(), times_a.len(), "packets before the retune");
+    assert_eq!(pb.len(), times_b.len(), "packets after the retune");
+    assert!(
+        from(addr_s).is_empty(),
+        "a packet in the settling time was decoded"
+    );
+    for (p, &t) in pa.iter().zip(&times_a) {
+        assert_eq!(ble::mhz_from_rf_channel(p.rf_channel), 2426);
+        assert!((p.time - t).abs() < 2e-6, "time {} vs {t}", p.time);
+    }
+    for (p, &t) in pb.iter().zip(&times_b) {
+        assert_eq!(ble::mhz_from_rf_channel(p.rf_channel), 2480);
+        assert!((p.time - t).abs() < 2e-6, "time {} vs {t}", p.time);
+    }
+}
