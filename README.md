@@ -48,7 +48,9 @@ HackRF One ──► channelizer (PFB) ──► burst detector ──► GFSK d
   error correction.
 - Inquiry (GIAC/DIAC) and page ID packets.
 - The UAP and master clock (CLK6-1) of each piconet are discovered
-  automatically, so headers are de-whitened and their HEC verified.
+  automatically, so headers are de-whitened and their HEC verified. When a
+  piconet's clock stops fitting, for example after samples were lost, it is
+  searched for again.
 - Payload decoding with CRC check for FHS, DM1, DH1, DM3, DH3, DM5 and DH5.
 - Soft-decision FEC: soft majority voting for the header and Chase decoding
   for the rate-2/3 payload code.
@@ -472,6 +474,12 @@ contains overlapping transmissions.
   Until then its packets are reported with the LAP only.
 - **Timestamps** are the host clock at start plus the sample count, so
   relative timing is precise to well under a microsecond.
+- **Silently lost samples:** a HackRF can lose samples without telling the
+  host, e.g. a whole USB transfer (131072 samples, 6.55 ms at 20 Msps).
+  Later timestamps are then early by that amount. Locked piconets lose
+  their clock, notice it after a few packets and search for it again
+  (`clock lost …, searching again`), which usually takes 0.5–10 s. In an
+  8-hour sweep this happened about twice an hour.
 - **Validation:** the following has been verified on live traffic with a
   HackRF One:
   - LE advertising, and LE connections both followed from `CONNECT_IND` and

@@ -299,3 +299,104 @@ fn follows_a_retune() {
         assert!((p.time - t).abs() < 2e-6, "time {} vs {t}", p.time);
     }
 }
+
+/// A HackRF can lose a USB transfer without telling the host. The time base
+/// then jumps by 131072 samples (6.55 ms at 20 Msps, about 10.5 slots), and
+/// the predicted clock of every locked piconet is wrong. With only POLL and
+/// NULL packets (or encrypted payloads) no CRC can confirm a clock, so the
+/// decoder has to notice the failures and search for the clock again.
+#[test]
+fn relocks_after_lost_samples() {
+    use btsdr::bredr;
+    use btsdr::synth::{BR_DEV, Scene, XorShift, br_packet_bits};
+    let fs = 20e6;
+    let duration = 0.8;
+    let cut_at = 0.4;
+    let lost = 131072usize;
+    let (lap, uap) = (0xB13350u32, 0xFBu8);
+    let slot = 625e-6;
+    let mut sc = Scene::new(fs, 2426, duration);
+    let mut rng = XorShift(7);
+    let freqs: Vec<u32> = (2418..=2434).collect();
+    let mut sent_after = 0;
+    // sniff-like traffic: master POLL every 20 slots, slave NULL right after;
+    // every third exchange the master sends a 17-byte DM1 whose payload is
+    // unreadable (encrypted): it decodes without FEC errors but fails the CRC,
+    // and under the complementary clock its header reads as an FHS.
+    let mut n = 4u32;
+    let mut exchange = 0;
+    while (n as f64 + 2.0) * slot < duration {
+        let master = if exchange % 3 == 2 { 3u8 } else { 1 };
+        exchange += 1;
+        for (k, ptype) in [(0u32, master), (1, 0)] {
+            let t = (n + k) as f64 * slot + 0.0001;
+            let f = freqs[(rng.next_u64() % freqs.len() as u64) as usize];
+            let clk6 = ((n + k) & 63) as u8;
+            let mut bits = br_packet_bits(lap, uap, clk6, ptype, 1, false, 2, &[0; 17]);
+            if ptype == 3 {
+                let key: Vec<u8> = (0..160).map(|_| (rng.next_u64() & 1) as u8).collect();
+                for (b, k) in bits[126..].iter_mut().zip(bredr::fec23_encode(&key)) {
+                    *b ^= k;
+                }
+            }
+            sc.add(t, f, &bits, BR_DEV, 0.25, 0.0);
+            if t > cut_at + 0.01 {
+                sent_after += 1;
+            }
+        }
+        n += 20;
+    }
+    let noise_rms = 0.25 / 10f32.powf(25.0 / 20.0) * (fs as f32 / 1e6).sqrt();
+    let mut data = sc.to_ci8(noise_rms, 3);
+    let cut = 2 * (cut_at * fs) as usize;
+    data.drain(cut..cut + 2 * lost);
+
+    let cfg = CaptureConfig {
+        center_mhz: 2426,
+        sample_rate_mhz: 20,
+        channels_mhz: CaptureConfig::default_channels(2426, 20),
+        squelch_db: 8.0,
+        ble: None,
+        bredr: Some(BrConfig::default()),
+        follow: vec![],
+        max_duration: None,
+        record: None,
+        wall_start_ns: 0,
+        status_interval: None,
+    };
+    let out = Arc::new(Mutex::new(Collected::default()));
+    let mut rep = Reporter::new(Box::new(std::io::sink()), true, false);
+    pipeline::run(
+        Box::new(MemorySource::new(data)),
+        cfg,
+        vec![Box::new(Collect(out.clone()))],
+        &mut rep,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let c = out.lock().unwrap();
+    let shift = lost as f64 / fs;
+    let after: Vec<&BrPacket> =
+        c.br.iter()
+            .filter(|p| p.lap == lap && p.time > cut_at + 0.01 - shift)
+            .collect();
+    let decoded: Vec<&&BrPacket> = after.iter().filter(|p| p.ptype().is_some()).collect();
+    for p in &decoded {
+        assert_eq!(p.lt_addr(), 1, "wrong clock: {}", p.describe());
+        assert!(
+            matches!(p.ptype().unwrap(), 0 | 1 | 3),
+            "wrong clock: {}",
+            p.describe()
+        );
+    }
+    assert!(
+        after.len() + 2 >= sent_after,
+        "{} of {sent_after} packets found",
+        after.len()
+    );
+    assert!(
+        ratio(decoded.len(), sent_after) >= 0.8,
+        "only {} of {sent_after} packets decoded after the lost samples",
+        decoded.len()
+    );
+}

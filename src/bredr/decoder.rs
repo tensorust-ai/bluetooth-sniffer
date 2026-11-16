@@ -32,6 +32,12 @@ pub const SLOT: f64 = 625e-6;
 /// How far (bits) after the energy onset a packet may start.
 pub const SEARCH_AFTER_ONSET: usize = 80;
 
+/// A locked piconet whose clock fails on this many of its last 8 packets is
+/// searched for again. A HackRF can lose a USB transfer without telling the
+/// host; the time base then jumps by about 10.5 slots, and without payloads
+/// that a CRC can confirm the old clock never fits again.
+const RELOCK_MISSES: u32 = 5;
+
 /// Wireshark "payload transport" values (upper nibble already shifted).
 pub const TRANSPORT_ANY: u8 = 0x00;
 pub const TRANSPORT_ACL: u8 = 0x30;
@@ -489,6 +495,10 @@ pub struct Piconet {
     voters: u16,
     t_first: f64,
     buffer: Vec<RawPacket>,
+    /// While locked: one bit per recent packet, set if it did not decode.
+    recent_misses: u8,
+    /// While locked: packets decoded or missed since the lock (saturating).
+    since_lock: u8,
     pub first_seen: f64,
     pub last_seen: f64,
     pub packets: u64,
@@ -506,6 +516,8 @@ impl Piconet {
             voters: 0,
             t_first: t,
             buffer: Vec::new(),
+            recent_misses: 0,
+            since_lock: 0,
             first_seen: t,
             last_seen: t,
             packets: 0,
@@ -516,6 +528,24 @@ impl Piconet {
 
     pub fn clock_known(&self) -> bool {
         self.clk.is_some()
+    }
+
+    /// Record whether a packet decoded with the locked clock. Returns true
+    /// if the lock looks lost; the clock is then dropped (the UAP is kept)
+    /// and discovery starts again.
+    fn track_lock(&mut self, decoded: bool, t: f64) -> bool {
+        self.recent_misses = (self.recent_misses << 1) | u8::from(!decoded);
+        self.since_lock = self.since_lock.saturating_add(1);
+        if self.since_lock < 8 || self.recent_misses.count_ones() < RELOCK_MISSES {
+            return false;
+        }
+        self.clk = None;
+        self.votes.iter_mut().for_each(|v| *v = 0);
+        self.voters = 0;
+        self.t_first = t;
+        self.recent_misses = 0;
+        self.since_lock = 0;
+        true
     }
 }
 
@@ -819,6 +849,13 @@ impl BrDecoder {
         pn.channels.insert(raw.rf_channel);
         if pn.clk.is_some() {
             let pkt = self.decode_locked(&raw);
+            let pn = self.piconets.get_mut(&lap).unwrap();
+            if pn.track_lock(pkt.clk6.is_some(), raw.time) {
+                self.notes.push(format!(
+                    "BR piconet LAP={lap:06x}: clock lost ({RELOCK_MISSES} of the last 8 packets \
+                     undecodable), searching again"
+                ));
+            }
             out.push(pkt);
             return;
         }
@@ -933,7 +970,10 @@ impl BrDecoder {
                 best = Some((c, pl, true));
                 break;
             }
-            if best.is_none() && delta.abs() <= 1 && type_plausible(pt, raw.air_bits, c) {
+            // An FHS is never encrypted, so without a valid CRC it is the
+            // alias of a DM1 under the complementary clock (63 - clk6).
+            if best.is_none() && delta.abs() <= 1 && pt != 2 && type_plausible(pt, raw.air_bits, c)
+            {
                 best = Some((c, pl, false));
             }
         }

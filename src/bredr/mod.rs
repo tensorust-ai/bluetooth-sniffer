@@ -431,6 +431,31 @@ pub fn packet_air_bits(fec: Fec, payload_info_bits: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// The whitening of clk6 and of its complement (63 - clk6) differ by a
+    /// valid header code word, so every header also passes the HEC under the
+    /// complementary clock: TYPE bit 0 flips (NULL<->POLL, FHS<->DM1),
+    /// LT_ADDR is XORed with 6 (1 -> 7) and ARQN/SEQN flip. No other pair
+    /// of clocks aliases. A decoder may only use the complement when its
+    /// clock prediction is wrong, e.g. after lost samples.
+    #[test]
+    fn complementary_clocks_alias_headers() {
+        let mask = |c: u8| {
+            let mut b = [0u8; 18];
+            whiten(&mut b, c, 0);
+            bits::to_u32(&b)
+        };
+        for c in 0..64u8 {
+            for d in 0..64u8 {
+                let diff = mask(c) ^ mask(d);
+                let aliases = c != d && header_valid(0, diff);
+                assert_eq!(aliases, d == 63 - c, "clk6 {c} vs {d}");
+                if aliases {
+                    assert_eq!(diff & 0x3FF, 0b11_0000_1110, "clk6 {c}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn syncword_matches_known_value() {
         // Sync word for LAP 0x000000 as tabulated by libbtbb (host/air order).

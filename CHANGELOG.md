@@ -61,3 +61,12 @@ First release.
   - `--sweep 2410,2427,2472` visits only the given centre frequencies.
   - The extcap settings have a matching option.
   - The status line shows the current centre frequency.
+- BR piconet clock recovery: a locked piconet whose clock fails on 5 of its
+  last 8 packets is searched for again, with its UAP kept.
+  - This happens when a HackRF silently loses samples, e.g. a USB transfer
+    (about 10.5 slots). Links that carry only POLL/NULL and encrypted
+    payloads stayed undecodable for 2–12 minutes before; live they now
+    recover in 0.5–10 s.
+  - An FHS is only reported with a valid CRC. Without one it is an
+    encrypted DM1 read with the complementary clock (63 − CLK6-1), which
+    turns DM1 into FHS and LT_ADDR 1 into 7.

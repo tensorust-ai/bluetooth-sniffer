@@ -324,6 +324,34 @@ drift. If nothing fits (for example an FHS sent during page response with
 its special whitening, or after a long gap), all 64 clocks are tried and
 only a CRC-confirmed result is accepted.
 
+**Complementary clock.** The whitening sequences of `c` and `63 − c` differ
+by a valid header code word, so every header also passes the HEC under the
+complementary clock. It then reads with TYPE bit 0 flipped (NULL↔POLL,
+FHS↔DM1), LT_ADDR XORed with 6 and ARQN/SEQN flipped. No other pair of
+clocks aliases. This only matters when the prediction is already wrong,
+and it has two consequences:
+- An FHS is accepted only with a valid CRC. FHS packets are never
+  encrypted, and an encrypted 17-byte DM1 has the same length, so an
+  unconfirmed "FHS" is a DM1 read with the wrong clock.
+- Live, the aliases showed up as POLL/NULL/FHS packets with LT_ADDR 7 on a
+  piconet that only used LT_ADDR 1.
+
+**Losing the lock.** A HackRF can lose samples without telling the host,
+for example a whole USB transfer of 131072 samples (6.55 ms at 20 Msps,
+about 10.5 slots). All later timestamps are then early by that amount; live,
+jumps of 6.55 ms and 2.4 ms were seen. On a link that carries only POLL/NULL
+and encrypted payloads, nothing can be confirmed by CRC, and the old clock
+never fits again. Live, such a piconet stayed undecodable for 2–12 minutes,
+apart from occasional complementary-clock aliases.
+
+The decoder therefore watches the last 8 packets of a locked piconet. When
+5 of them fail to decode, it drops the clock, keeps the UAP and starts
+discovery again, with the votes restricted to the known UAP. The packets of
+the new search are buffered and decoded once the new lock is found. The
+event is logged as `clock lost (…), searching again`. In a 15-minute live
+sweep a piconet lost its clock twice and was locked again after 0.5 s and
+10 s; 96% of its headers were de-whitened, against 81–94% before.
+
 **Inquiry.** Packets with an inquiry access code (LAP `0x9E8B00`–`0x9E8B3F`)
 use the DCI `0x00` as UAP. Their whitening clock is brute-forced per packet,
 with HEC plus CRC confirmation. This decodes FHS inquiry responses, which
@@ -471,7 +499,10 @@ executable there and checks that the copy answers `--extcap-interfaces`.
   25 dB SNR and degrade gracefully at 14 dB. A second test inserts a retune
   marker: packets before it must keep the old channels, packets after it
   must get the new ones with continuous timestamps, and a packet inside the
-  settling time must be dropped.
+  settling time must be dropped. A third test removes one USB transfer
+  (131072 samples) from a piconet that sends only POLL, NULL and encrypted
+  DM1 packets. At least 80% of the packets after the cut must decode again,
+  all with the true LT_ADDR and packet types.
 - **Sensitivity benchmark** (`examples/benchmark.rs`): packet success rate
   versus SNR on synthetic captures with impairments within the
   specification limits (carrier offset and drift, modulation index spread,
