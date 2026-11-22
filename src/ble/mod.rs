@@ -319,6 +319,19 @@ pub fn describe_adv_pdu(pdu: &[u8]) -> String {
                 let u: Vec<String> = info.uuids16.iter().map(|u| format!("{u:04x}")).collect();
                 s += &format!(" uuid16=[{}]", u.join(","));
             }
+            if let Some(f) =
+                remoteid::ble::find_in_advertising_data(&p[6..]).and_then(|r| r.frame().ok())
+            {
+                f.for_each_message(|m| match m {
+                    remoteid::Message::BasicId(b) => {
+                        s += &format!(" rid_id=\"{}\"", b.uas_id_str().unwrap_or("?"));
+                    }
+                    remoteid::Message::Location(l) => {
+                        s += &format!(" rid_pos={:.6},{:.6}", l.latitude, l.longitude);
+                    }
+                    _ => {}
+                });
+            }
         }
         0x1 if p.len() >= 12 => {
             s += &format!(
@@ -502,5 +515,21 @@ mod tests {
         assert!(!access_address_plausible(0x0000_0000));
         assert!(!access_address_plausible(0x5555_5555)); // too many transitions
         assert!(access_address_plausible(0x50654A3C));
+    }
+
+    #[test]
+    fn describe_adv_decodes_remote_id() {
+        let id = remoteid::BasicId::new(
+            remoteid::IdType::SerialNumber,
+            remoteid::UaType::HelicopterOrMultirotor,
+            "1581F5FKD229400EQ5",
+        )
+        .unwrap();
+        let mut ad = [0u8; 31];
+        let n = remoteid::ble::write_advertising_data(7, &id.encode().unwrap(), &mut ad).unwrap();
+        let mut pdu = vec![0x42, (6 + n) as u8, 1, 2, 3, 4, 5, 6];
+        pdu.extend_from_slice(&ad[..n]);
+        let s = describe_adv_pdu(&pdu);
+        assert!(s.contains("rid_id=\"1581F5FKD229400EQ5\""), "{s}");
     }
 }
